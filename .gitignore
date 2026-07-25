@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ZeroAI 运行时生成
+.zeroai/
+.zeroai_config.json
+logs/
+*.log
+
+# 语音模型（体积大，不入库）
+models/
+libs/
+
+# 代理服务敏感配置（含真实 API Key）
+zeroai-proxy/.env
+zeroai-proxy/.venv/
+zeroai-proxy/logs/
+zeroai-proxy/__pycache__/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 构建产物
+*.whl
+*.tar.gz
+*.spec.bak
+
+# 备份文件
+*.bak_*
+*.bak
