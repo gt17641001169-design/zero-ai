@@ -1064,6 +1064,248 @@ COMPRESS_THRESHOLD_RATIO = 0.7
 # 压缩后保留的最近对话轮数（用户+助手算一轮）
 KEEP_RECENT_TURNS = 4
 
+# ====== 主动上下文清理（轻量级，在压缩之前触发）======
+# 触发清理的阈值（默认上下文长度的 30%，远低于压缩阈值）
+# 目的：在上下文堆积早期就主动清理工具输出，避免后期压缩时信息密度过低
+CLEANUP_THRESHOLD_RATIO = 0.3
+# 清理时保留的最近对话轮数（比压缩保留的更多，确保当前任务上下文完整）
+CLEANUP_KEEP_RECENT_TURNS = 6
+# 工具输出摘要的最大长度（超过此长度的工具结果会被摘要化）
+TOOL_OUTPUT_SUMMARY_MAX_LEN = 200
+
+
+def _summarize_tool_output(tool_name: str, content: str) -> str:
+    """将冗长的工具输出摘要为简短结论（不调用 AI，纯规则提取）。
+
+    策略：
+    1. 如果内容已很短（< TOOL_OUTPUT_SUMMARY_MAX_LEN），原样保留
+    2. 否则提取关键信息：工具名 + 内容长度 + 首尾片段 + 关键指标
+    """
+    if not content or not isinstance(content, str):
+        return content if content else ""
+
+    # 非 str 类型转 str
+    if not isinstance(content, str):
+        content = str(content)
+
+    # 很短的工具输出直接保留
+    if len(content) <= TOOL_OUTPUT_SUMMARY_MAX_LEN:
+        return content
+
+    # 提取关键指标：百分比、状态词、数字
+    import re
+    indicators = []
+
+    # 磁盘/内存/CPU 百分比
+    pcts = re.findall(r"(\d+)%", content)
+    if pcts:
+        indicators.append(f"百分比:{','.join(pcts[:5])}")
+
+    # 状态标记
+    for keyword in ["✅", "⚠️", "🚨", "正常", "警告", "危急", "Error", "错误", "失败"]:
+        if keyword in content:
+            count = content.count(keyword)
+            indicators.append(f"{keyword}×{count}")
+
+    # 端口号
+    ports = re.findall(r"端口\s*(\d+)", content)
+    if ports:
+        indicators.append(f"端口:{','.join(ports[:5])}")
+
+    # PID
+    pids = re.findall(r"PID[:\s]+(\d+)", content)
+    if pids:
+        indicators.append(f"PID:{','.join(pids[:5])}")
+
+    # 构造摘要
+    indicator_str = " ".join(indicators) if indicators else "无关键指标"
+    head = content[:60].replace("\n", " ").strip()
+    tail = content[-60:].replace("\n", " ").strip()
+
+    summary = f"[工具结果已清理 | {tool_name} | 原长度{len(content)}字 | {indicator_str}]\n开头: {head}...\n结尾: ...{tail}"
+    return summary
+
+
+def cleanup_context(messages: list, context_limit: int,
+                    keep_recent_turns: int = CLEANUP_KEEP_RECENT_TURNS) -> tuple:
+    """主动清理上下文：保留用户意图和工具结论，丢弃工具原始输出。
+
+    与 compress_context 的区别：
+    - compress_context：调用 GLM 总结历史，开销大，阈值高（70%）
+    - cleanup_context：纯规则清理，零延迟，阈值低（30%），更早触发
+
+    策略：
+    1. 估算 token 数，未超清理阈值则原样返回
+    2. 超阈值则：
+       - 保留所有 system 消息
+       - 保留最近 N 轮完整对话（含工具调用细节）
+       - 对较早的消息：
+         * user 消息：完整保留（用户意图是核心）
+         * assistant 消息含 tool_calls：保留文本内容，移除 tool_calls 字段
+         * tool 消息：替换为简短摘要
+         * 纯文本 assistant 消息：保留前 200 字
+
+    Returns:
+        (cleaned_messages, cleanup_info)
+        - cleaned_messages: 清理后的消息列表
+        - cleanup_info: dict，含清理统计信息
+    """
+    est_tokens = _estimate_tokens(messages)
+    threshold = int(context_limit * CLEANUP_THRESHOLD_RATIO)
+
+    if est_tokens <= threshold:
+        return messages, {"triggered": False, "reason": "未超清理阈值"}
+
+    # 分离 system 消息和对话消息
+    system_msgs = []
+    convo_msgs = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_msgs.append(msg)
+        else:
+            convo_msgs.append(msg)
+
+    # 找到最近 N 轮的起始位置
+    keep_start_idx = 0
+    user_count = 0
+    for i in range(len(convo_msgs) - 1, -1, -1):
+        if convo_msgs[i].get("role") == "user":
+            user_count += 1
+            if user_count >= keep_recent_turns:
+                keep_start_idx = i
+                break
+
+    # 分为待清理部分和保留部分
+    to_clean = convo_msgs[:keep_start_idx]
+    keep_recent = convo_msgs[keep_start_idx:]
+
+    if len(to_clean) < 2:
+        return messages, {"triggered": False, "reason": "待清理消息过少"}
+
+    # 对待清理部分进行摘要化
+    cleaned_msgs = []
+    tool_cleaned_count = 0
+    assistant_cleaned_count = 0
+    tokens_saved = 0
+
+    for msg in to_clean:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        old_tokens = _estimate_tokens([msg])
+
+        if role == "user":
+            # 用户消息完整保留（用户意图是核心）
+            cleaned_msgs.append(msg)
+        elif role == "tool":
+            # 工具消息：替换为简短摘要
+            tool_name = msg.get("name", "unknown_tool")
+            content_str = content if isinstance(content, str) else str(content)
+            summarized = _summarize_tool_output(tool_name, content_str)
+            new_msg = {
+                "role": "tool",
+                "tool_call_id": msg.get("tool_call_id", ""),
+                "name": tool_name,
+                "content": summarized,
+            }
+            cleaned_msgs.append(new_msg)
+            tool_cleaned_count += 1
+        elif role == "assistant":
+            # 助手消息：保留文本，移除 tool_calls（避免 API 报错）
+            new_msg = {"role": "assistant", "content": content}
+            # 如果内容过长，截断保留前 300 字
+            if isinstance(content, str) and len(content) > 300:
+                new_msg["content"] = content[:300] + "...[已截断]"
+                assistant_cleaned_count += 1
+            # 注意：不保留 tool_calls 字段，因为没有对应的 tool 消息会报错
+            cleaned_msgs.append(new_msg)
+        else:
+            # 其他角色原样保留
+            cleaned_msgs.append(msg)
+
+        new_tokens = _estimate_tokens([cleaned_msgs[-1]])
+        tokens_saved += max(0, old_tokens - new_tokens)
+
+    new_messages = system_msgs + cleaned_msgs + keep_recent
+    new_tokens_total = _estimate_tokens(new_messages)
+
+    return new_messages, {
+        "triggered": True,
+        "old_tokens": est_tokens,
+        "new_tokens": new_tokens_total,
+        "tokens_saved": tokens_saved,
+        "tool_cleaned": tool_cleaned_count,
+        "assistant_cleaned": assistant_cleaned_count,
+        "old_count": len(messages),
+        "new_count": len(new_messages),
+    }
+
+
+async def cleanup_and_compress(app, log_func=None):
+    """统一上下文管理：先轻量清理，再按需压缩。
+
+    两层防护：
+    1. cleanup_context（30% 阈值）：纯规则，零延迟，摘要化早期工具输出
+    2. compress_context（70% 阈值）：调用 GLM 总结，处理超大上下文
+
+    在调用 AI 前调用此函数，自动决定是否需要清理/压缩。
+
+    Args:
+        app: ZeroAIApp 实例（需要 self.messages, self.context_limit）
+        log_func: 可选的日志输出函数（用于 TUI 显示清理进度）
+    """
+    try:
+        est_tokens = _estimate_tokens(app.messages)
+
+        # ── 第1层：主动清理（30% 阈值）──
+        cleanup_threshold = int(app.context_limit * CLEANUP_THRESHOLD_RATIO)
+        if est_tokens > cleanup_threshold and len(app.messages) > 8:
+            old_tokens = est_tokens
+            old_count = len(app.messages)
+            app.messages, info = cleanup_context(app.messages, app.context_limit)
+
+            if info.get("triggered"):
+                new_tokens = info["new_tokens"]
+                if log_func:
+                    log_func(
+                        f"  {_load_svg_icon('tool')} 上下文主动清理\n"
+                        f"  │ 工具输出摘要化：{info['tool_cleaned']} 个工具结果，"
+                        f"{info['assistant_cleaned']} 个助手消息截断\n"
+                        f"  │ {old_count}→{info['new_count']} 条消息，"
+                        f"约 {old_tokens}→{new_tokens} tokens（节省 {old_tokens - new_tokens}）\n"
+                        f"  └─\n",
+                        C_DIM,
+                    )
+                est_tokens = new_tokens  # 更新当前 token 数，供下层判断
+
+        # ── 第2层：GLM 压缩（70% 阈值，清理后仍超限才触发）──
+        compress_threshold = int(app.context_limit * COMPRESS_THRESHOLD_RATIO)
+        if est_tokens > compress_threshold and len(app.messages) > 10:
+            if log_func:
+                log_func(
+                    f"  {_load_svg_icon('tool')} 上下文深度压缩\n"
+                    f"  │ 清理后仍超阈值（{est_tokens} > {compress_threshold}），调用 GLM 总结…\n",
+                    C_DIM,
+                )
+            old_count = len(app.messages)
+            old_tokens = est_tokens
+            app.messages = await compress_context(app.messages, app.context_limit)
+            new_tokens = _estimate_tokens(app.messages)
+            new_count = len(app.messages)
+            if log_func:
+                log_func(
+                    f"  {_load_svg_icon('check')} 压缩完成："
+                    f"{old_count}→{new_count} 条消息，"
+                    f"约 {old_tokens}→{new_tokens} tokens\n"
+                    f"  └─\n",
+                    C_DIM,
+                )
+    except Exception as e:
+        if log_func:
+            log_func(
+                f"  {_load_svg_icon('warning')} 上下文管理跳过：{str(e)[:80]}\n",
+                C_DIM,
+            )
+
 
 def _estimate_tokens(messages: list) -> int:
     """粗略估算消息列表的 token 数"""
@@ -12975,29 +13217,27 @@ class ZeroAI(App):
             self._is_generating = False
             return
 
-        # ── 上下文自动压缩：超阈值时先压缩历史 ──
-        try:
-            est_tokens = _estimate_tokens(self.messages)
-            threshold = int(self.context_limit * COMPRESS_THRESHOLD_RATIO)
-            if est_tokens > threshold and len(self.messages) > 10:
-                block_compress = self._add_block("上下文压缩", C_DIM)
-                block_compress.update(Text.assemble(
-                    (f"  {_load_svg_icon('tool')} 上下文自动压缩\n", f"bold {C_DIM}"),
-                    (f"  │ 当前约 {est_tokens} tokens，超过阈值 {threshold}，正在压缩…\n", C_DIM),
-                ))
-                old_count = len(self.messages)
-                old_tokens = est_tokens
-                self.messages = await compress_context(self.messages, self.context_limit)
-                new_tokens = _estimate_tokens(self.messages)
-                new_count = len(self.messages)
-                self._add_static(Text.assemble(
-                    (f"  {_load_svg_icon('check')} 压缩完成：", C_DIM),
-                    (f"{old_count}→{new_count} 条消息，", f"bold {C_FG}"),
-                    (f"约 {old_tokens}→{new_tokens} tokens\n", C_DIM),
-                    ("  └─\n", C_DIM),
-                ))
-        except Exception as e:
-            self._add_static(Text(f"  {_load_svg_icon('warning')} 上下文压缩跳过：{str(e)[:80]}\n", style=C_DIM))
+        # ── 上下文管理：主动清理 + 按需压缩（两层防护，防止幻觉）──
+        def _ctx_log(text, style=None):
+            self._add_static(Text.assemble(
+                (text, style if style else C_DIM),
+            ))
+
+        # 用 block 显示清理/压缩进度
+        est_tokens_pre = _estimate_tokens(self.messages)
+        cleanup_threshold = int(self.context_limit * CLEANUP_THRESHOLD_RATIO)
+        compress_threshold = int(self.context_limit * COMPRESS_THRESHOLD_RATIO)
+
+        if est_tokens_pre > cleanup_threshold and len(self.messages) > 8:
+            block_ctx = self._add_block("上下文管理", C_DIM)
+            block_ctx.update(Text.assemble(
+                (f"  {_load_svg_icon('tool')} 上下文管理\n", f"bold {C_DIM}"),
+                (f"  │ 当前约 {est_tokens_pre} tokens（清理阈值 {cleanup_threshold}，压缩阈值 {compress_threshold}）\n", C_DIM),
+            ))
+            await cleanup_and_compress(self, _ctx_log)
+        else:
+            # 未触发清理阈值，但仍调用一次（内部会判断是否需要压缩）
+            await cleanup_and_compress(self, _ctx_log if est_tokens_pre > compress_threshold else None)
 
         # 获取用户最后一条消息
         last_user = ""
