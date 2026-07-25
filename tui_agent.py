@@ -884,7 +884,8 @@ English abstract content.
 }
 
 # 工作模式：expert（专家路由）/ hybrid（混合思考）/ manual（手动指定模型）
-WORK_MODE = "expert"
+# 默认 hybrid：启用多专家子代理协作（GLM分析→多专家并行→GLM汇总）
+WORK_MODE = "hybrid"
 
 # 全局停止标志（供独立函数检查 Ctrl+C 状态，避免无法中断的阻塞）
 _GLOBAL_STOP = False
@@ -12076,7 +12077,7 @@ class ZeroAI(App):
         super().__init__()
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.model_key = CURRENT_MODEL_KEY
-        self.work_mode = "expert"  # expert / hybrid / manual
+        self.work_mode = "hybrid"  # expert / hybrid / manual（默认混合思考，启用多专家子代理）
         # 可调参数
         self.temperature = 0.3
         self.stream_enabled = True
