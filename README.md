@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-green.svg)]()
 [![License](https://img.shields.io/badge/License-Proprietary-orange.svg)]()
-[![PyPI](https://img.shields.io/badge/PyPI-zero--ai--cli-1.1.0-blue.svg)](https://pypi.org/project/zero-ai-cli/)
+[![PyPI](https://img.shields.io/badge/PyPI-zero--ai--cli-1.1.2-blue.svg)](https://pypi.org/project/zero-ai-cli/)
 
 </div>
 

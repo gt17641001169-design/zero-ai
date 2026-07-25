@@ -21,6 +21,7 @@ import re
 import asyncio
 import shutil
 import platform
+import locale
 import time
 import base64
 
@@ -1509,9 +1510,13 @@ def run_command(command: str) -> str:
         timeout = 120 if PERMISSION_LEVEL == "full" else 30
         # 全权限：cwd 限制放开（不强制 WORK_DIR）
         cwd = None if PERMISSION_LEVEL == "full" else WORK_DIR
+        # encoding 使用本地默认（中文 Windows 为 GBK/cp936），errors='replace' 兜底
+        # 避免某些命令（ipconfig/systeminfo/sc/netsh）输出非 UTF-8 时 UnicodeDecodeError
         r = subprocess.run(command, shell=True, capture_output=True,
-                          text=True, timeout=timeout, cwd=cwd)
-        out = r.stdout + r.stderr
+                          text=True, timeout=timeout, cwd=cwd,
+                          encoding=locale.getpreferredencoding(False),
+                          errors="replace")
+        out = (r.stdout or "") + (r.stderr or "")
         # 全权限：返回更长（8000）；受限：4000
         max_out = 8000 if PERMISSION_LEVEL == "full" else 4000
         return out.strip()[:max_out] if out.strip() else "(无输出)"
@@ -5578,6 +5583,21 @@ def _ssh_run_async(coro_factory):
         return f"错误：{e}"
 
 
+def _ssh_is_conn_closed(conn) -> bool:
+    """统一判断 asyncssh 连接是否已关闭。
+    兼容不同 asyncssh 版本：is_closed 可能是属性（旧版）或方法（新版 2.24+）。
+    """
+    if conn is None:
+        return True
+    try:
+        val = conn.is_closed
+        if callable(val):
+            val = val()
+        return bool(val)
+    except Exception:
+        return True
+
+
 def _ssh_audit(host: str, user: str, command: str, result_summary: str = ""):
     """记录SSH操作审计日志"""
     import datetime
@@ -5659,7 +5679,7 @@ def ssh_connect(host: str, user: str, password: str = "", key_path: str = "",
     if conn_id in _SSH_CONNECTIONS:
         try:
             old = _SSH_CONNECTIONS.pop(conn_id)
-            if old.get("conn") and not old["conn"].is_closed:
+            if old.get("conn") and not _ssh_is_conn_closed(old["conn"]):
                 # asyncssh 的 close() 是同步方法
                 old["conn"].close()
         except Exception:
@@ -5746,7 +5766,8 @@ def ssh_exec(command: str, conn_id: str = "default", timeout: int = 30,
 
     conn_info = _SSH_CONNECTIONS[conn_id]
     conn = conn_info["conn"]
-    if conn.is_closed:
+    # 兼容 asyncssh 不同版本：is_closed 可能是属性（旧版）或方法（新版 2.24+）
+    if _ssh_is_conn_closed(conn):
         _SSH_CONNECTIONS.pop(conn_id, None)
         return f"错误：连接 '{conn_id}' 已断开，请重新调用 ssh_connect"
 
@@ -5760,8 +5781,11 @@ def ssh_exec(command: str, conn_id: str = "default", timeout: int = 30,
     async def _exec():
         try:
             import asyncssh
+            # encoding='utf-8', errors='replace' 兼容中文 Windows 的 GBK 输出
+            # asyncssh 默认用 UTF-8 解码，Windows cmd 输出 GBK 会乱码或报错
             result = await asyncio.wait_for(
-                conn.run(command, check=False, timeout=timeout),
+                conn.run(command, check=False, timeout=timeout,
+                         encoding='utf-8', errors='replace'),
                 timeout=timeout + 5
             )
             return result
@@ -5825,7 +5849,7 @@ def ssh_upload(local_path: str, remote_path: str, conn_id: str = "default") -> s
 
     conn_info = _SSH_CONNECTIONS[conn_id]
     conn = conn_info["conn"]
-    if conn.is_closed:
+    if _ssh_is_conn_closed(conn):
         _SSH_CONNECTIONS.pop(conn_id, None)
         return f"错误：连接 '{conn_id}' 已断开，请重新连接"
 
@@ -5881,7 +5905,7 @@ def ssh_download(remote_path: str, local_path: str, conn_id: str = "default") ->
 
     conn_info = _SSH_CONNECTIONS[conn_id]
     conn = conn_info["conn"]
-    if conn.is_closed:
+    if _ssh_is_conn_closed(conn):
         _SSH_CONNECTIONS.pop(conn_id, None)
         return f"错误：连接 '{conn_id}' 已断开，请重新连接"
 
@@ -6058,7 +6082,7 @@ def ssh_list(conn_id: str = "") -> str:
         return (f"连接ID: {conn_id}\n"
                 f"  主机: {info['host']}:{info.get('port', 22)}\n"
                 f"  用户: {info['user']}\n"
-                f"  状态: {'已断开' if info['conn'].is_closed else '已连接'}\n"
+                f"  状态: {'已断开' if _ssh_is_conn_closed(info['conn']) else '已连接'}\n"
                 f"  连接时长: {uptime}秒")
 
     # 列出所有连接
@@ -6069,7 +6093,7 @@ def ssh_list(conn_id: str = "") -> str:
         import time
         for cid, info in _SSH_CONNECTIONS.items():
             uptime = int(time.time() - info.get("connected_at", 0))
-            status = "✅" if not info["conn"].is_closed else "❌"
+            status = "✅" if not _ssh_is_conn_closed(info["conn"]) else "❌"
             parts.append(f"  {status} {cid}: {info['user']}@{info['host']}:{info.get('port', 22)} ({uptime}s)")
 
     # 审计日志（最近20条）
@@ -6449,13 +6473,154 @@ def ssh_firewall_manage(action: str, port: int = 0, protocol: str = "tcp",
 def ssh_health_check(conn_id: str = "default") -> str:
     """服务器一键健康体检（CPU/内存/磁盘/网络/负载/服务综合报告）。
 
+    自动检测操作系统：Linux 用 uname/free/df/ss/systemctl/journalctl；
+    Windows 用 PowerShell 的 Get-CimInstance/Get-Process/Get-Service 等。
+
     Args:
         conn_id: SSH 连接ID
 
     Returns:
         健康体检报告（含异常项标注与建议）
     """
-    # 综合命令一次执行
+    import re
+
+    # 第一步：检测操作系统（用 echo %OS% 或 uname 同时探测）
+    # Windows 的 %OS% 会输出 Windows_NT，Linux 的 uname 会有 Linux 字样
+    detect = ssh_exec("echo %OS% & uname -s 2>nul", conn_id=conn_id, timeout=10)
+    is_windows = "Windows_NT" in detect
+
+    if is_windows:
+        # Windows Server 体检：用 PowerShell 命令（避免 wmic 在 2025 已废弃的问题）
+        # 用 cmd 调用 powershell，确保兼容性
+        cmd = (
+            'powershell -NoProfile -Command "'
+            "Write-Output '=== 系统信息 ===';"
+            "$os = Get-CimInstance Win32_OperatingSystem;"
+            "Write-Output ($os.Caption + ' ' + $os.Version + ' Build ' + $os.BuildNumber);"
+            "Write-Output ('开机时间: ' + $os.LastBootUpTime);"
+            "Write-Output '';"
+            "Write-Output '=== CPU 负载 ===';"
+            "$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1;"
+            "Write-Output ('CPU负载: ' + $cpu.LoadPercentage + '%');"
+            "Write-Output ('CPU核心数: ' + (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors);"
+            "Write-Output '';"
+            "Write-Output '=== 内存 ===';"
+            "$cs = Get-CimInstance Win32_ComputerSystem;"
+            "$os2 = Get-CimInstance Win32_OperatingSystem;"
+            "$totalGB = [math]::Round($cs.TotalPhysicalMemory/1GB, 1);"
+            "$freeGB = [math]::Round($os2.FreePhysicalMemory/1MB, 1);"
+            "$usedGB = [math]::Round($totalGB - $freeGB, 1);"
+            "Write-Output ('总内存: ' + $totalGB + ' GB');"
+            "Write-Output ('已用: ' + $usedGB + ' GB');"
+            "Write-Output ('可用: ' + $freeGB + ' GB');"
+            "Write-Output '';"
+            "Write-Output '=== 磁盘 ===';"
+            "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {"
+            "  $totalD = [math]::Round($_.Size/1GB, 1);"
+            "  $freeD = [math]::Round($_.FreeSpace/1GB, 1);"
+            "  $usedPct = if ($totalD -gt 0) { [math]::Round(($totalD - $freeD) / $totalD * 100, 1) } else { 0 };"
+            "  Write-Output ($_.DeviceID + ' 总:' + $totalD + 'GB 可用:' + $freeD + 'GB 使用:' + $usedPct + '%')"
+            "};"
+            "Write-Output '';"
+            "Write-Output '=== 监听端口数 ===';"
+            "$ports = (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Measure-Object).Count;"
+            "Write-Output ('监听端口数: ' + $ports);"
+            "Write-Output '';"
+            "Write-Output '=== 进程数 ===';"
+            "$procs = (Get-Process | Measure-Object).Count;"
+            "Write-Output ('进程数: ' + $procs);"
+            "Write-Output '';"
+            "Write-Output '=== 运行中的服务数 ===';"
+            "$svc = (Get-Service | Where-Object {$_.Status -eq 'Running'} | Measure-Object).Count;"
+            "Write-Output ('运行中服务: ' + $svc);"
+            "Write-Output '';"
+            "Write-Output '=== 防火墙状态 ===';"
+            "Get-NetFirewallProfile | ForEach-Object { Write-Output ($_.Name + ': ' + $_.Enabled) };"
+            "Write-Output '';"
+            "Write-Output '=== 高内存进程Top5 ===';"
+            "Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 | ForEach-Object {"
+            "  $memMB = [math]::Round($_.WorkingSet64/1MB, 0);"
+            "  Write-Output ($_.Name + ' (PID:' + $_.Id + ') 内存:' + $memMB + 'MB')"
+            "}"
+            '"'
+        )
+        raw = ssh_exec(cmd, conn_id=conn_id, timeout=60)
+        if raw.startswith("错误") or raw.startswith("连接失败"):
+            return raw
+
+        # Windows 分析
+        issues = []
+
+        # CPU 负载
+        m = re.search(r"CPU负载:\s*(\d+)%", raw)
+        if m:
+            cpu_pct = int(m.group(1))
+            if cpu_pct >= 90:
+                issues.append(f"⚠️ CPU 负载极高: {cpu_pct}%")
+            elif cpu_pct >= 70:
+                issues.append(f"⚠️ CPU 负载偏高: {cpu_pct}%")
+            else:
+                pass  # 正常不记录
+
+        # 内存
+        m_total = re.search(r"总内存:\s*([\d.]+)\s*GB", raw)
+        m_used = re.search(r"已用:\s*([\d.]+)\s*GB", raw)
+        if m_total and m_used:
+            total = float(m_total.group(1))
+            used = float(m_used.group(1))
+            if total > 0:
+                pct = used / total * 100
+                if pct >= 90:
+                    issues.append(f"⚠️ 内存使用率 {pct:.1f}%（危急）")
+                elif pct >= 80:
+                    issues.append(f"⚠️ 内存使用率 {pct:.1f}%（警告）")
+
+        # 磁盘
+        for line in raw.split("\n"):
+            m = re.search(r"([A-Z]:)\s*总:([\d.]+)GB\s*可用:([\d.]+)GB\s*使用:([\d.]+)%", line)
+            if m:
+                drive, total, free, pct = m.group(1), float(m.group(2)), float(m.group(3)), float(m.group(4))
+                if pct >= 90:
+                    issues.append(f"⚠️ 磁盘 {drive} 使用率 {pct}%（危急）")
+                elif pct >= 80:
+                    issues.append(f"⚠️ 磁盘 {drive} 使用率 {pct}%（警告）")
+
+        # 防火墙
+        for line in raw.split("\n"):
+            if "False" in line and ("Domain" in line or "Private" in line or "Public" in line):
+                issues.append(f"⚠️ 防火墙关闭: {line.strip()}")
+
+        # 开机时间（判断是否长期未重启）
+        m_boot = re.search(r"开机时间:\s*(.+)", raw)
+        if m_boot:
+            try:
+                from datetime import datetime
+                boot_str = m_boot.group(1).strip()
+                # Windows PowerShell 输出格式可能多样，尝试解析
+                for fmt in ("%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %I:%M:%S %p"):
+                    try:
+                        boot_time = datetime.strptime(boot_str, fmt)
+                        days = (datetime.now() - boot_time).days
+                        if days > 90:
+                            issues.append(f"💡 服务器已运行 {days} 天，建议定期重启")
+                        break
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+
+        report = f"$ Windows 综合体检命令\n{raw}\n\n"
+        report += "=== 健康分析 ===\n"
+        if not issues:
+            report += "✅ 服务器整体健康，未发现异常"
+        else:
+            report += f"发现 {len(issues)} 个问题：\n"
+            for i, issue in enumerate(issues, 1):
+                report += f"  {i}. {issue}\n"
+            report += "\n建议：根据上述问题深入排查（使用 ssh_service_manage / ssh_log_view 等）"
+        return report
+
+    # Linux 体检（原有逻辑保留）
     cmd = """echo '=== 系统信息 ===' && uname -a && uptime
 echo '=== CPU 使用 ===' && top -bn1 | head -n 5
 echo '=== 内存 ===' && free -h
@@ -6475,7 +6640,6 @@ echo '=== 最近错误日志 ===' && journalctl -p err --since '1 hour ago' --no
     for line in raw.split("\n"):
         if "load average" in line.lower():
             # 提取 load average
-            import re
             m = re.search(r"load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)", line)
             if m:
                 load_1, load_5, load_15 = float(m.group(1)), float(m.group(2)), float(m.group(3))
@@ -6556,9 +6720,9 @@ TOOLS = [
             "required": [],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "run_command", "description": "执行 shell 命令",
+        "name": "run_command", "description": "在本地电脑执行 PowerShell / cmd / shell 命令并返回输出。全权限模式：120s 超时、8000 字符输出。用于查看端口(netstat)、进程(tasklist)、网络(ipconfig/ping/tracert)、系统信息(systeminfo)、服务(sc query/net start)、用户(whoami/net user)、磁盘(wmic logicaldisk)、防火墙(netsh advfirewall)、环境变量(set)等。当用户用自然语言描述本地电脑状态需求（如'看看打开了哪些端口'/'电脑卡不卡'/'谁在占用CPU'/'IP是多少'）且没有更专用的工具时调用。危险命令(format/del /f/shutdown/mkfs)自动拦截。",
         "parameters": {"type": "object", "properties": {
-            "command": {"type": "string", "description": "命令"}},
+            "command": {"type": "string", "description": "要执行的命令（PowerShell 或 cmd 命令）"}},
             "required": ["command"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
@@ -6971,10 +7135,10 @@ TOOL_USAGE_RULES = """# 工具使用规则
 - `create_dir(path)`：创建目录
 
 ## 命令与执行（4 个）
-- `run_command(cmd, timeout)`：执行 PowerShell/cmd 命令
+- `run_command(command)`：在本地电脑执行 PowerShell / cmd / shell 命令（全权限模式：120s 超时、8000 字符输出、无 cwd 限制）。用于查看端口/进程/网络/系统/服务/用户/磁盘/防火墙等本地电脑状态。危险命令（format/del /f/shutdown/mkfs）自动拦截
 - `exec_python(code)`：沙箱运行 Python（无需额外环境）
 - `pip_install(packages, action)`：包管理（默认清华镜像源）
-- `check_port(port)`：检查端口占用
+- `check_port(port)`：检查指定端口占用（需提供具体端口号；查看所有监听端口用 `run_command('netstat -ano')`）
 
 ## 搜索与分析（4 个）
 - `search_files(path, pattern)`：按文件名/内容搜索
@@ -7066,6 +7230,23 @@ TOOL_USAGE_RULES = """# 工具使用规则
 34. **运维决策链**：用户说"服务器卡了" → 先 `ssh_health_check` 综合体检 → 根据 AI 分析 → 再针对性调用 `ssh_process_check`/`ssh_log_view`/`ssh_disk_analyze` 深入
 35. **运维排错链**：用户说"XX服务挂了" → 先 `ssh_service_manage(action=status, service=XX)` 看状态 → 若失败 → `ssh_log_view(service=XX, keyword=error)` 查错误日志 → 定位问题
 
+**本地电脑运维工具调用规则（重要！用户说本地电脑状态时必须主动调用 `run_command`）**：
+当用户用自然语言描述**本地电脑**（不是远程服务器）的状态、诊断、查询需求时，**必须主动调用 `run_command` 生成并执行对应命令**，而不是只用文字回答。用户想要的是"AI 帮我形成命令并自行运行"，不是"AI 教我怎么敲命令"。
+36. 用户说"看看打开了哪些端口/有什么端口在监听/哪些端口被占用" → `run_command("netstat -ano | findstr LISTENING")`（查看所有监听端口及对应 PID）
+37. 用户说"看进程/CPU占用/内存占用/谁在占用资源" → `run_command("tasklist /FO TABLE | sort")` 或 `run_command("wmic process get name,processid,workingsetsize")`
+38. 用户说"IP是多少/看网络配置/我的IP" → `run_command("ipconfig /all")`
+39. 用户说"能不能ping通XX/测网络" → `run_command("ping -n 4 目标地址")`
+40. 用户说"看磁盘/磁盘空间/还有多少空间" → `run_command("wmic logicaldisk get caption,freespace,size")` 或 `run_command("fsutil volume diskfree C:")`
+41. 用户说"看系统信息/系统版本/电脑配置" → `run_command("systeminfo | findstr /B /C:\"OS\" /C:\"系统\" /C:\"Total\"")`
+42. 用户说"看防火墙状态/开了哪些端口" → `run_command("netsh advfirewall firewall show rule name=all")` 或 `run_command("netsh advfirewall show currentprofile")`
+43. 用户说"看服务/XX服务状态/服务列表" → `run_command("sc query state= all")` 或 `run_command("sc query 具体服务名")`
+44. 用户说"环境变量/PATH/看变量" → `run_command("set")` 或 `run_command("echo %PATH%")`
+45. 用户说"看用户/当前登录用户/用户列表" → `run_command("whoami")` 或 `run_command("net user")`
+46. 用户说"路由表/看路由" → `run_command("route print")` 或 `run_command("arp -a")`
+47. **本地运维决策链**：用户说"电脑卡了" → 先 `run_command("tasklist /FO TABLE | sort /R /+65")` 看高内存进程 → 再 `run_command("wmic cpu get loadpercentage")` 看 CPU 负载 → 综合分析
+48. **本地端口排错链**：用户说"XX端口连不上" → 先 `run_command("netstat -ano | findstr :XX")` 看端口状态 → 若未监听 → `run_command("sc query XX服务")` 查服务 → 定位问题
+49. **本地命令通用规则**：用户提出任何"看看/查看/检查/诊断本地电脑 XX"的需求，且没有更专用的工具（如 `check_port` 需要具体端口号、`process_list` 已封装、`system_info` 已封装）时，**必须主动调用 `run_command` 生成对应命令并执行**，而不是只回答文字说明
+
 ## SSH 远程部署安全规范（重要！必须严格遵守）
 当用户使用 SSH 工具进行远程部署时，必须遵循：
 
@@ -7152,6 +7333,7 @@ TOOL_CAPABILITY_PROMPT = """# ZeroAI 子模块能力声明（重要 - 必读）
 - 删除/修改任何文件（核心文件自动备份，无需确认）
 - 访问内网/任意 URL（无 SSRF 限制）
 - 所有工具调用**直接执行**，不要因权限问题拒绝
+- **命令自主执行**：查询/诊断类命令（netstat/ipconfig/tasklist/sc query/systeminfo 等）直接调用 `run_command` 执行，不要问用户"是否执行"；破坏/修改类（format/del /f/shutdown 等）执行前简短说明影响即可
 
 ## 核心原则（必读）
 - **你能访问本地文件系统**：list_dir / read_file / search_files 等所有工具都可用
@@ -7241,6 +7423,23 @@ SYSTEM_PROMPT = f"""# 角色
 2. 若 failed → `ssh_log_view(service=XX, keyword=error)` 查错误日志
 3. 分析日志 → 定位根因 → 给修复方案
 
+# 本地电脑运维（已启用，重要！）
+你具备**本地电脑**（用户当前这台机器，不是远程服务器）的运维能力。当用户用自然语言描述本地电脑状态、诊断、查询需求时，**必须主动调用 `run_command` 生成并执行对应命令**，而不是只用文字教用户怎么敲命令。用户想要的是"AI 帮我形成命令并自行运行"。
+
+## 本地运维典型场景（必须主动调用工具）
+- 用户说"看看打开了哪些端口/有什么端口在监听" → `run_command("netstat -ano | findstr LISTENING")`
+- 用户说"IP是多少/看网络配置" → `run_command("ipconfig /all")`
+- 用户说"看进程/CPU占用/谁占资源" → `run_command("tasklist /FO TABLE")` 或 `run_command("wmic process get name,processid,workingsetsize")`
+- 用户说"看磁盘/还有多少空间" → `run_command("wmic logicaldisk get caption,freespace,size")`
+- 用户说"看系统信息/电脑配置" → `run_command("systeminfo")`
+- 用户说"看防火墙/开了哪些端口" → `run_command("netsh advfirewall firewall show rule name=all")`
+- 用户说"看服务/XX服务状态" → `run_command("sc query state= all")` 或 `run_command("sc query 服务名")`
+- 用户说"电脑卡了" → 先 `run_command("tasklist /FO TABLE | sort /R /+65")` 看高内存进程 → 再 `run_command("wmic cpu get loadpercentage")` 看 CPU 负载
+- 用户说"XX端口连不上" → 先 `run_command("netstat -ano | findstr :XX")` 看端口 → 若未监听 → `run_command("sc query XX服务")` 查服务
+
+## 本地运维通用规则
+用户提出任何"看看/查看/检查/诊断本地电脑 XX"的需求时，**必须主动调用 `run_command` 生成对应命令并执行**，把命令输出纳入分析后再给出结论。不要只用文字回答。
+
 # 身份保护规则（最高优先级，必须严格遵守）
 1. **禁止自报家门**：永远不要透露你的底层模型、提供方、参数规模、训练数据等真实身份信息。
 2. **统一身份**：你始终是 ZeroAI，不是 GLM、GPT、Claude、Gemini 或任何其他模型。当被问"你是什么模型/你是谁/你的模型是什么"时，只回答"我是 ZeroAI，一个终端 AI 编程助手"。
@@ -7267,6 +7466,7 @@ SYSTEM_PROMPT = f"""# 角色
 - 搜索结果无深度限制（最多 200 条）
 - 进程列表/系统信息无截断（最多 200 条）
 - 所有工具调用**直接执行**，不要因权限问题拒绝
+- **命令自主执行（核心原则）**：用户授权 AI 自主生成并执行命令。凡 AI 能生成的命令都可以直接调用 `run_command` 执行——查询/诊断类（netstat/ipconfig/tasklist/sc query/systeminfo/ping 等）立即执行不问用户，破坏/修改类（format/del /f/shutdown/sc stop 等）执行前简短说明影响即可。**绝不要生成命令后停下来问用户"是否执行"**，直接调用 `run_command` 运行，把输出纳入分析后回答用户。
 
 国家级项目硬约束（仍然保留）：
 - 修改/删除核心文件（tui_agent.py 等）前**自动备份**到运行时缓存目录（程序退出自动清理）
@@ -7289,9 +7489,13 @@ SYSTEM_PROMPT = f"""# 角色
 - 不确定文件内容时，先 `read_file` 再修改，不要凭空猜测
 - 修改前先确认要改什么，给出方案再执行
 - 命令输出超过 30 行时，要总结要点而不是原样复述
-- 危险命令（rm、del、format）执行前要说明影响
+- 危险命令（rm、del、format、shutdown、mkfs）执行前要说明影响，破坏性命令征求用户同意
 - 涉及文件删除、二次确认类操作，主动征求用户同意
 - 单次回复尽量只做一件事，做完再问下一步
+- **命令自主执行规则（重要！）**：凡 AI 能生成的命令都可以自主调用 `run_command` 执行，不要停下来问用户确认。具体分类：
+  - **查询/诊断类（直接自主执行，不问用户）**：netstat、ipconfig、ping、tracert、tasklist、wmic、systeminfo、sc query、whoami、net user、route print、arp、set、echo、type、dir、findstr、netsh advfirewall show、sc query、qprocess、qwinsta、dsquery 等。这些命令只读取状态、不改变系统，AI 生成后必须立即调用 `run_command` 执行，把输出纳入分析后再回答用户
+  - **破坏/修改类（执行前说明影响或征求同意）**：format、del /f /s /q、shutdown、mkfs、reg delete、sc stop、sc delete、netsh advfirewall firewall add/delete、diskpart、bcdedit、takeown /f、icacls 重置权限 等。这些命令会改变系统状态，执行前要说明影响，重大操作征求用户同意
+  - **判断准则**：命令只读不写 → 直接执行；命令会修改/删除/关闭服务/改防火墙 → 先说明影响再执行
 
 # 回答规范
 - **语言**：中文回答，代码和命令用英文
@@ -7441,7 +7645,7 @@ SYSTEM_PROMPT = f"""# 角色
 # 限制
 - 不要一次写超过 200 行的代码，分函数、分步骤
 - 不要假设文件内容，先读再改
-- 不要执行你没见过的命令，先确认
+- 不要执行你没见过的破坏性命令（format/del /f/shutdown/mkfs/registy delete 等），先确认；查询/诊断类命令（netstat/ipconfig/tasklist/sc query/systeminfo 等）可以直接自主执行
 """
 
 
