@@ -5751,6 +5751,30 @@ def _ssh_audit(host: str, user: str, command: str, result_summary: str = ""):
         _SSH_AUDIT_LOG.pop(0)
 
 
+def _ssh_format_prefix(conn_id: str = "default") -> str:
+    """生成运维结果的服务器标识前缀（防混淆）。
+
+    格式: "[conn_id@host]" 或 "[conn_id@host | 备注]"
+
+    多服务器场景下，每个运维工具的返回结果都应以此前缀开头，
+    让用户和 AI 一眼看清这是哪台机器的输出。
+
+    Args:
+        conn_id: 连接ID
+
+    Returns:
+        形如 "[nas@192.168.10.6 | NAS存储服务器]" 的前缀字符串
+    """
+    info = _SSH_CONNECTIONS.get(conn_id)
+    if not info:
+        return f"[{conn_id}@未知]"
+    host = info.get("host", "?")
+    remark = info.get("remark", "")
+    if remark:
+        return f"[{conn_id}@{host} | {remark}]"
+    return f"[{conn_id}@{host}]"
+
+
 def _ssh_check_dangerous(command: str) -> tuple:
     """检查命令是否危险，返回 (is_dangerous, matched_pattern)"""
     import re
@@ -5794,7 +5818,7 @@ def _ssh_validate_host(host: str) -> tuple:
 
 
 def ssh_connect(host: str, user: str, password: str = "", key_path: str = "",
-                port: int = 22, conn_id: str = "default") -> str:
+                port: int = 22, conn_id: str = "default", remark: str = "") -> str:
     """连接到远程SSH服务器。
 
     支持密码认证和密钥认证两种方式。连接成功后保持长连接，后续命令通过 conn_id 复用。
@@ -5806,6 +5830,7 @@ def ssh_connect(host: str, user: str, password: str = "", key_path: str = "",
         key_path: SSH私钥路径（如 ~/.ssh/id_rsa），密码和密钥二选一
         port: SSH端口，默认22
         conn_id: 连接标识符，用于多服务器管理，默认"default"
+        remark: 服务器备注/角色（如 "NAS存储"、"Web前端"、"数据库"），便于多服务器场景下识别，防混淆
 
     Returns:
         连接状态信息
@@ -5877,15 +5902,21 @@ def ssh_connect(host: str, user: str, password: str = "", key_path: str = "",
             "user": user,
             "port": port if ":" not in host else int(host.split(":")[1]),
             "connected_at": time.time(),
+            "remark": remark,  # 服务器备注/角色（防混淆）
         }
-        _ssh_audit(host, user, "[CONNECT]", f"成功 conn_id={conn_id}")
-        return f"✅ SSH连接成功\n  主机: {host}\n  用户: {user}\n  端口: {port if ':' not in host else host.split(':')[1]}\n  连接ID: {conn_id}\n  认证方式: {'密钥' if key_path else '密码'}"
+        # 连接建立后清除 OS 缓存，下次运维工具调用时重新探测
+        _SSH_OS_CACHE.pop(conn_id, None)
+        _ssh_audit(host, user, "[CONNECT]", f"成功 conn_id={conn_id} remark={remark}")
+        remark_line = f"\n  备注: {remark}" if remark else ""
+        return (f"✅ SSH连接成功\n  主机: {host}\n  用户: {user}\n  端口: {port if ':' not in host else host.split(':')[1]}\n"
+                f"  连接ID: {conn_id}\n  认证方式: {'密钥' if key_path else '密码'}{remark_line}\n"
+                f"  提示: 后续运维操作请传 conn_id='{conn_id}'")
     except Exception as e:
         return f"连接失败：{e}"
 
 
 def ssh_exec(command: str, conn_id: str = "default", timeout: int = 30,
-             confirm_dangerous: bool = False) -> str:
+             confirm_dangerous: bool = False, _internal: bool = False) -> str:
     """在远程服务器上执行Shell命令。
 
     通过已建立的SSH连接执行命令。危险命令（如rm -rf /、mkfs、shutdown）需要
@@ -5896,9 +5927,10 @@ def ssh_exec(command: str, conn_id: str = "default", timeout: int = 30,
         conn_id: 连接ID（由ssh_connect返回），默认"default"
         timeout: 命令超时时间（秒），默认30
         confirm_dangerous: 是否确认执行危险命令，默认False
+        _internal: 内部调用标记（运维工具内部调用时传 True，不加服务器前缀，避免前缀重复）
 
     Returns:
-        命令输出结果（stdout + stderr）
+        命令输出结果（stdout + stderr），默认带服务器标识前缀防混淆
     """
     import asyncio
 
@@ -5940,9 +5972,10 @@ def ssh_exec(command: str, conn_id: str = "default", timeout: int = 30,
 
     try:
         result = _ssh_run_async(_exec)
+        prefix = "" if _internal else _ssh_format_prefix(conn_id) + "\n"
         if isinstance(result, str):
             _ssh_audit(conn_info["host"], conn_info["user"], command, result[:100])
-            return result
+            return prefix + result
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""
@@ -5966,7 +5999,8 @@ def ssh_exec(command: str, conn_id: str = "default", timeout: int = 30,
         if exit_code != 0:
             parts.append(f"[退出码: {exit_code}]")
 
-        return "\n".join(parts) if parts else "[无输出]"
+        body = "\n".join(parts) if parts else "[无输出]"
+        return prefix + body
     except Exception as e:
         return f"执行错误: {e}"
 
@@ -6023,7 +6057,7 @@ def ssh_upload(local_path: str, remote_path: str, conn_id: str = "default") -> s
             _ssh_audit(conn_info["host"], conn_info["user"],
                        f"[UPLOAD] {local_path} → {remote_path}",
                        f"{local_size}B")
-            return f"✅ 上传成功\n  本地: {local_path} ({local_size} 字节)\n  远程: {remote_path}"
+            return f"{_ssh_format_prefix(conn_id)}\n✅ 上传成功\n  本地: {local_path} ({local_size} 字节)\n  远程: {remote_path}"
         return f"上传失败: {result}"
     except Exception as e:
         return f"上传错误: {e}"
@@ -6074,7 +6108,7 @@ def ssh_download(remote_path: str, local_path: str, conn_id: str = "default") ->
             _ssh_audit(conn_info["host"], conn_info["user"],
                        f"[DOWNLOAD] {remote_path} → {local_path}",
                        f"{local_size}B")
-            return f"✅ 下载成功\n  远程: {remote_path}\n  本地: {local_path} ({local_size} 字节)"
+            return f"{_ssh_format_prefix(conn_id)}\n✅ 下载成功\n  远程: {remote_path}\n  本地: {local_path} ({local_size} 字节)"
         return f"下载失败: {result}"
     except Exception as e:
         return f"下载错误: {e}"
@@ -6133,7 +6167,7 @@ def ssh_deploy(deploy_config: dict, conn_id: str = "default") -> str:
         report.append("📋 [步骤] 环境检查")
         for cmd in deploy_config["pre_check"]:
             step += 1
-            result = ssh_exec(cmd, conn_id, timeout=15)
+            result = ssh_exec(cmd, conn_id, _internal=True, timeout=15)
             status = "✅" if "错误" not in result and "exit_code" not in result.lower() else "⚠️"
             report.append(f"  {status} [{step}/{total_steps}] {cmd}")
             report.append(f"     {result[:200]}")
@@ -6165,7 +6199,7 @@ def ssh_deploy(deploy_config: dict, conn_id: str = "default") -> str:
         remote_dir = deploy_config.get("remote_dir", "")
         report.append(f"📦 [步骤 {step}/{total_steps}] 安装依赖: {install_cmd}")
         full_cmd = f"cd {remote_dir} && {install_cmd}" if remote_dir else install_cmd
-        result = ssh_exec(full_cmd, conn_id, timeout=120)
+        result = ssh_exec(full_cmd, conn_id, _internal=True, timeout=120)
         report.append(f"  {result[:500]}")
         report.append("")
 
@@ -6183,7 +6217,7 @@ def ssh_deploy(deploy_config: dict, conn_id: str = "default") -> str:
         step += 1
         health_cmd = deploy_config["health_check"]
         report.append(f"🏥 [步骤 {step}/{total_steps}] 健康检查: {health_cmd}")
-        result = ssh_exec(health_cmd, conn_id, timeout=15)
+        result = ssh_exec(health_cmd, conn_id, _internal=True, timeout=15)
         status = "✅ 健康" if "错误" not in result and "exit_code" not in result.lower() else "⚠️ 需检查"
         report.append(f"  {status}")
         report.append(f"  {result[:300]}")
@@ -6194,7 +6228,7 @@ def ssh_deploy(deploy_config: dict, conn_id: str = "default") -> str:
         for cmd in deploy_config["post_cmds"]:
             step += 1
             report.append(f"⚙️ [步骤 {step}/{total_steps}] 后置: {cmd}")
-            result = ssh_exec(cmd, conn_id, timeout=30)
+            result = ssh_exec(cmd, conn_id, _internal=True, timeout=30)
             report.append(f"  {result[:200]}")
             report.append("")
 
@@ -6203,7 +6237,7 @@ def ssh_deploy(deploy_config: dict, conn_id: str = "default") -> str:
     report.append(f"✅ 部署完成 ({step}/{total_steps} 步骤已执行)")
     report.append("=" * 50)
 
-    return "\n".join(report)
+    return _ssh_format_prefix(conn_id) + "\n" + "\n".join(report)
 
 
 def ssh_list(conn_id: str = "") -> str:
@@ -6213,30 +6247,57 @@ def ssh_list(conn_id: str = "") -> str:
         conn_id: 指定连接ID查看详情，留空查看所有连接和最近审计日志
 
     Returns:
-        连接状态和审计日志
+        连接状态和审计日志（含备注/角色、操作系统、连接时长，便于多服务器场景识别）
     """
+    def _fmt_uptime(secs: int) -> str:
+        """格式化连接时长"""
+        if secs < 60:
+            return f"{secs}s"
+        if secs < 3600:
+            return f"{secs // 60}m{secs % 60}s"
+        return f"{secs // 3600}h{(secs % 3600) // 60}m"
+
     if conn_id:
         if conn_id not in _SSH_CONNECTIONS:
             return f"连接 '{conn_id}' 不存在"
         info = _SSH_CONNECTIONS[conn_id]
         import time
         uptime = int(time.time() - info.get("connected_at", 0))
-        return (f"连接ID: {conn_id}\n"
-                f"  主机: {info['host']}:{info.get('port', 22)}\n"
-                f"  用户: {info['user']}\n"
-                f"  状态: {'已断开' if _ssh_is_conn_closed(info['conn']) else '已连接'}\n"
-                f"  连接时长: {uptime}秒")
+        is_closed = _ssh_is_conn_closed(info["conn"])
+        os_type = _SSH_OS_CACHE.get(conn_id, "?") if not is_closed else "?"
+        remark = info.get("remark", "")
+        lines = [
+            f"连接ID: {conn_id}",
+            f"  主机: {info['host']}:{info.get('port', 22)}",
+            f"  用户: {info['user']}",
+            f"  状态: {'❌ 已断开' if is_closed else '✅ 已连接'}",
+            f"  操作系统: {os_type}",
+            f"  连接时长: {_fmt_uptime(uptime)}",
+        ]
+        if remark:
+            lines.append(f"  备注: {remark}")
+        return "\n".join(lines)
 
     # 列出所有连接
     parts = ["=== SSH 连接状态 ==="]
     if not _SSH_CONNECTIONS:
         parts.append("  (无活动连接)")
+        parts.append("  提示: 用 ssh_connect(host, user, password, conn_id='自定义ID', remark='服务器用途') 连接")
     else:
         import time
+        parts.append(f"  共 {len(_SSH_CONNECTIONS)} 个连接:")
+        parts.append("")
         for cid, info in _SSH_CONNECTIONS.items():
             uptime = int(time.time() - info.get("connected_at", 0))
-            status = "✅" if not _ssh_is_conn_closed(info["conn"]) else "❌"
-            parts.append(f"  {status} {cid}: {info['user']}@{info['host']}:{info.get('port', 22)} ({uptime}s)")
+            is_closed = _ssh_is_conn_closed(info["conn"])
+            status = "❌" if is_closed else "✅"
+            os_type = _SSH_OS_CACHE.get(cid, "?") if not is_closed else "?"
+            remark = info.get("remark", "")
+            line = (f"  {status} {cid}: {info['user']}@{info['host']}:{info.get('port', 22)} "
+                    f"({ _fmt_uptime(uptime)}) [OS: {os_type}]")
+            if remark:
+                line += f" 备注: {remark}"
+            parts.append(line)
 
     # 审计日志（最近20条）
     if _SSH_AUDIT_LOG:
@@ -6315,8 +6376,8 @@ def ssh_service_manage(action: str, service: str, conn_id: str = "default") -> s
             if action == "status":
                 # 列出所有运行中的服务（State=Running）
                 cmd = 'powershell -NoProfile -Command "Get-Service | Where-Object {$_.Status -eq \'Running\'} | Format-Table Name, DisplayName, Status -AutoSize"'
-                raw = ssh_exec(cmd, conn_id=conn_id, timeout=30)
-                return f"$ 列出所有运行中的服务\n{raw}\n\n提示：共显示运行中的服务，可用 ssh_service_manage(action='status', service='具体服务名') 查看单个服务详情"
+                raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=30)
+                return f"{_ssh_format_prefix(conn_id)}\n$ 列出所有运行中的服务\n{raw}\n\n提示：共显示运行中的服务，可用 ssh_service_manage(action='status', service='具体服务名') 查看单个服务详情"
             else:
                 return f"错误：service='all' 只支持 action='status'"
         else:
@@ -6338,7 +6399,7 @@ def ssh_service_manage(action: str, service: str, conn_id: str = "default") -> s
                     cmd = f'sc qc {service}'
                 else:  # reload
                     return "错误：Windows 服务不支持 reload，请用 restart"
-                raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+                raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=15)
                 interp = ""
                 if action == "enable":
                     interp = " → ✅ 已设置开机自启（自动启动）"
@@ -6351,14 +6412,14 @@ def ssh_service_manage(action: str, service: str, conn_id: str = "default") -> s
                         interp = " → 手动启动"
                     elif "DISABLED" in raw:
                         interp = " → 已禁用"
-                return f"$ {cmd}\n{raw}{interp}"
+                return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}{interp}"
 
             sc_cmd, sc_action = action_map.get(action, ("sc", "query"))
             if action == "restart":
                 cmd = f'{sc_cmd} {sc_action} {service}'
             else:
                 cmd = f'{sc_cmd} {sc_action} {service}'
-            raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+            raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=15)
 
             # Windows 状态解读
             interp = ""
@@ -6384,19 +6445,19 @@ def ssh_service_manage(action: str, service: str, conn_id: str = "default") -> s
                 elif "1062" in raw or "not started" in raw.lower():
                     interp = " → 服务未在运行"
 
-            return f"$ {cmd}\n{raw}{interp}"
+            return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}{interp}"
 
     # Linux 服务管理（systemd，原有逻辑保留）
     if service == "all":
         if action == "status":
             cmd = "systemctl list-units --type=service --state=running --no-pager"
-            raw = ssh_exec(cmd, conn_id=conn_id, timeout=20)
-            return f"$ {cmd}\n{raw}"
+            raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=20)
+            return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}"
         else:
             return f"错误：service='all' 只支持 action='status'"
 
     cmd = f"systemctl {action} {service}"
-    raw = ssh_exec(cmd, conn_id=conn_id, timeout=30)
+    raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=30)
 
     # 添加状态解读
     interpretation = ""
@@ -6419,7 +6480,7 @@ def ssh_service_manage(action: str, service: str, conn_id: str = "default") -> s
         elif "could not be found" in raw or "Loaded: not-found" in raw:
             interpretation = " ❌ 服务不存在（检查服务名拼写或未安装）"
 
-    return f"$ {cmd}\n{raw}{interpretation}"
+    return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}{interpretation}"
 
 
 def ssh_log_view(service: str = "", lines: int = 100, follow: bool = False,
@@ -6467,7 +6528,7 @@ def ssh_log_view(service: str = "", lines: int = 100, follow: bool = False,
                 '"'
             )
 
-        raw = ssh_exec(cmd, conn_id=conn_id, timeout=30)
+        raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=30)
         if raw.startswith("错误") or raw.startswith("连接失败"):
             return raw
 
@@ -6494,7 +6555,7 @@ def ssh_log_view(service: str = "", lines: int = 100, follow: bool = False,
         # follow 模式下加超时
         cmd = f"timeout 15 {cmd} -f" if "journalctl" in cmd else f"timeout 15 {cmd} -f"
 
-    raw = ssh_exec(cmd, conn_id=conn_id, timeout=30)
+    raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=30)
     if raw.startswith("错误") or raw.startswith("连接失败"):
         return raw
 
@@ -6506,7 +6567,7 @@ def ssh_log_view(service: str = "", lines: int = 100, follow: bool = False,
         summary += " ⚠️ 错误密度高，建议深入排查"
     elif err_count > 0:
         summary += " ℹ️ 存在少量错误"
-    return f"$ {cmd}\n{raw}{summary}"
+    return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}{summary}"
 
 
 def ssh_process_check(sort_by: str = "cpu", top_n: int = 15,
@@ -6542,7 +6603,7 @@ def ssh_process_check(sort_by: str = "cpu", top_n: int = 15,
             "Write-Output ('进程总数: ' + (Get-Process | Measure-Object).Count)"
             '"'
         )
-        raw = ssh_exec(cmd, conn_id=conn_id, timeout=20)
+        raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=20)
         if raw.startswith("错误") or raw.startswith("连接失败"):
             return raw
         header = "      PID        CPU         内存  名称\n"
@@ -6551,13 +6612,13 @@ def ssh_process_check(sort_by: str = "cpu", top_n: int = 15,
     # Linux 进程查看（ps 命令按 CPU/内存排序）
     sort_field = "-pcpu" if sort_by == "cpu" else "-pmem"
     cmd = f"ps aux --sort={sort_field} | head -n {top_n + 1}"
-    raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+    raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=15)
     if raw.startswith("错误") or raw.startswith("连接失败"):
         return raw
 
     # 获取系统总览
     overview = ssh_exec("uptime && free -h | head -n 2", conn_id=conn_id, timeout=5)
-    return f"$ {cmd}\n{raw}\n\n[系统总览]\n{overview}"
+    return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}\n\n[系统总览]\n{overview}"
 
 
 def ssh_disk_analyze(path: str = "/", conn_id: str = "default") -> str:
@@ -6682,8 +6743,8 @@ def ssh_network_diag(action: str = "stats", target: str = "",
             cmd = f'ping -n 4 -w 2000 {target}'
         else:  # connections
             cmd = 'powershell -NoProfile -Command "Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort | Sort-Object RemoteAddress | Format-Table -AutoSize | Out-String -Width 200"'
-        raw = ssh_exec(cmd, conn_id=conn_id, timeout=30 if action == "ping" else 15)
-        return f"$ {cmd}\n{raw}"
+        raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=30 if action == "ping" else 15)
+        return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}"
 
     # Linux 网络诊断（原有逻辑保留）
     if action == "stats":
@@ -6700,8 +6761,8 @@ def ssh_network_diag(action: str = "stats", target: str = "",
     else:  # connections
         cmd = "ss -tn state established 2>/dev/null | head -n 30"
 
-    raw = ssh_exec(cmd, conn_id=conn_id, timeout=30 if action == "ping" else 15)
-    return f"$ {cmd}\n{raw}"
+    raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=30 if action == "ping" else 15)
+    return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}"
 
 
 def ssh_docker_manage(action: str, container: str = "",
@@ -6751,10 +6812,10 @@ def ssh_docker_manage(action: str, container: str = "",
     else:  # images
         cmd = "docker images --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.Size}}'"
 
-    raw = ssh_exec(cmd, conn_id=conn_id, timeout=60 if action == "stats" else 30)
+    raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=60 if action == "stats" else 30)
     if "command not found" in raw.lower() or "not recognized" in raw.lower():
         return "❌ 服务器未安装 Docker"
-    return f"$ {cmd}\n{raw}"
+    return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}"
 
 
 def ssh_firewall_manage(action: str, port: int = 0, protocol: str = "tcp",
@@ -6801,7 +6862,7 @@ def ssh_firewall_manage(action: str, port: int = 0, protocol: str = "tcp",
         else:  # disable
             cmd = "netsh advfirewall set allprofiles state off"
 
-        raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+        raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=15)
         return f"[Windows 防火墙] $ {cmd}\n{raw}"
 
     # Linux 防火墙管理（原有逻辑保留）
@@ -6851,13 +6912,13 @@ def ssh_firewall_manage(action: str, port: int = 0, protocol: str = "tcp",
     # open/close 是危险操作（修改防火墙），需要确认
     if action in ("open", "close"):
         # 不直接执行，先返回待确认信息（通过 ssh_exec 的 confirm_dangerous 链路）
-        result = ssh_exec(cmd, conn_id=conn_id, timeout=15, confirm_dangerous=False)
+        result = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=15, confirm_dangerous=False)
         if "危险命令" in result and "confirm_dangerous" in result:
             # 实际上 ufw/firewalld 不在危险命令黑名单，可以直接执行
-            result = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+            result = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=15)
         raw = result
     else:
-        raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+        raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=15)
 
     return f"[防火墙类型: {fw_type}] $ {cmd}\n{raw}"
 
@@ -6934,7 +6995,7 @@ def ssh_health_check(conn_id: str = "default") -> str:
             "}"
             '"'
         )
-        raw = ssh_exec(cmd, conn_id=conn_id, timeout=60)
+        raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=60)
         if raw.startswith("错误") or raw.startswith("连接失败"):
             return raw
 
@@ -7008,7 +7069,7 @@ def ssh_health_check(conn_id: str = "default") -> str:
             for i, issue in enumerate(issues, 1):
                 report += f"  {i}. {issue}\n"
             report += "\n建议：根据上述问题深入排查（使用 ssh_service_manage / ssh_log_view 等）"
-        return report
+        return _ssh_format_prefix(conn_id) + "\n" + report
 
     # Linux 体检（原有逻辑保留）
     cmd = """echo '=== 系统信息 ===' && uname -a && uptime
@@ -7020,7 +7081,7 @@ echo '=== 系统负载 ===' && cat /proc/loadavg
 echo '=== 最近登录 ===' && last -n 5
 echo '=== 失败服务 ===' && systemctl --failed --no-pager 2>/dev/null | head -n 20
 echo '=== 最近错误日志 ===' && journalctl -p err --since '1 hour ago' --no-pager 2>/dev/null | tail -n 10"""
-    raw = ssh_exec(cmd, conn_id=conn_id, timeout=30)
+    raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=30)
     if raw.startswith("错误") or raw.startswith("连接失败"):
         return raw
 
@@ -7083,7 +7144,7 @@ echo '=== 最近错误日志 ===' && journalctl -p err --since '1 hour ago' --no
         for i, issue in enumerate(issues, 1):
             report += f"  {i}. {issue}\n"
         report += "\n建议：根据上述问题深入排查（使用 ssh_log_view / ssh_process_check 等）"
-    return report
+    return _ssh_format_prefix(conn_id) + "\n" + report
 
 
 TOOLS = [
@@ -7345,14 +7406,15 @@ TOOLS = [
             "additionalProperties": False}}},
     # ====== SSH 远程部署工具 ======
     {"type": "function", "function": {
-        "name": "ssh_connect", "description": "连接到远程SSH服务器（Linux部署用）。支持密码和密钥认证。连接成功后保持长连接。当用户要求远程部署、SSH连接、服务器管理时调用。",
+        "name": "ssh_connect", "description": "连接到远程SSH服务器（Linux/Windows 均可）。支持密码和密钥认证。连接成功后保持长连接，支持多服务器并行（通过 conn_id 区分）。当用户要求远程部署、SSH连接、服务器管理时调用。多服务器场景务必传 remark 标注用途防混淆。",
         "parameters": {"type": "object", "properties": {
             "host": {"type": "string", "description": "服务器地址（IP或域名，如 192.168.1.100）"},
-            "user": {"type": "string", "description": "登录用户名（如 root / deploy / ubuntu）"},
+            "user": {"type": "string", "description": "登录用户名（如 root / deploy / ubuntu / administrator）"},
             "password": {"type": "string", "description": "密码认证（与key_path二选一）"},
             "key_path": {"type": "string", "description": "SSH私钥路径（如 ~/.ssh/id_rsa），与password二选一"},
             "port": {"type": "integer", "description": "SSH端口，默认22"},
-            "conn_id": {"type": "string", "description": "连接标识符，多服务器时区分，默认'default'"}},
+            "conn_id": {"type": "string", "description": "连接标识符，多服务器时区分，默认'default'。建议起有意义的名字如 'nas'/'web1'/'db1'"},
+            "remark": {"type": "string", "description": "服务器备注/角色（如 'NAS存储'/'Web前端'/'数据库'），多服务器场景防混淆必填"}},
             "required": ["host", "user"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
@@ -7555,7 +7617,7 @@ TOOL_USAGE_RULES = """# 工具使用规则
 - `open_app(name)`：打开应用/文件（自动搜索本地，无需自定义路径）
 
 ## SSH 远程部署（7 个）
-- `ssh_connect(host, user, password, key_path, port, conn_id)`：连接远程服务器（Linux/Windows 均可，支持密码/密钥认证）。用户说"连接服务器/SSH部署/远程部署"时用
+- `ssh_connect(host, user, password, key_path, port, conn_id, remark)`：连接远程服务器（Linux/Windows 均可，支持密码/密钥认证）。用户说"连接服务器/SSH部署/远程部署"时用。**多服务器场景务必传 remark 标注用途防混淆**，conn_id 建议起有意义的名字如 'nas'/'web1'/'db1'
 - `ssh_exec(command, conn_id, timeout, confirm_dangerous)`：在远程服务器执行命令（自动适配 Linux/Windows）。危险命令（rm -rf /、mkfs、dd、format 等）需 confirm_dangerous=true 二次确认
 - `ssh_upload(local_path, remote_path, conn_id)`：上传文件到远程服务器（SFTP，Linux 自动 chmod 644）
 - `ssh_download(remote_path, local_path, conn_id)`：从远程服务器下载文件（SFTP，自动创建本地目录）
@@ -7599,7 +7661,7 @@ TOOL_USAGE_RULES = """# 工具使用规则
 16. 用户查最新研究/预印本/arXiv → `arxiv_search`（英文关键词效果更佳，支持分类筛选）
 17. 用户写综述/文献分析 → `literature_review`（双源检索+PRISMA流程+对比分析+研究空白）
 18. 引用任何文献前 → `citation_check`（校验真实性，防止编造！这条是红线）
-19. 用户说"连接服务器/SSH/远程" → `ssh_connect`（host/user/password 必填）
+19. 用户说"连接服务器/SSH/远程" → `ssh_connect`（host/user/password 必填）。**多服务器场景务必传 conn_id 和 remark**（如 conn_id="nas", remark="NAS存储服务器"），防混淆
 20. 用户说"在服务器上执行/远程运行" → `ssh_exec`（危险命令必须 confirm_dangerous=true 二次确认）
 21. 用户说"上传到服务器/部署文件" → `ssh_upload`（SFTP 传输）
 22. 用户说"从服务器下载/拉取" → `ssh_download`
@@ -7652,9 +7714,29 @@ TOOL_USAGE_RULES = """# 工具使用规则
 
 ### 3. 连接管理
 - 多服务器并行：通过 `conn_id` 区分不同服务器（如 "default"、"web1"、"db1"）
+- 服务器备注：`ssh_connect` 支持 `remark` 参数标注用途（如 "NAS存储"/"Web前端"），防混淆
 - 连接保活：30 秒 keepalive 心跳
 - 登录超时：15 秒
 - 操作超时：默认 30 秒，可配置
+
+### 3.1 多服务器防混淆规则（重要！）
+当连接了 2 台及以上服务器时，**必须严格遵守**以下规则防止操作错服务器：
+
+1. **连接时必填 remark**：每台服务器都要传 `remark` 参数标注用途
+   - 示例：`ssh_connect(host="192.168.10.6", user="admin", password="xxx", conn_id="nas", remark="NAS存储服务器")`
+   - 示例：`ssh_connect(host="192.168.10.7", user="root", password="yyy", conn_id="web1", remark="Web前端服务器")`
+
+2. **操作前先 ssh_list 确认**：多服务器场景下，执行任何运维操作前，**先调用 `ssh_list` 查看当前所有连接**，确认目标服务器的 conn_id
+
+3. **每次操作明确目标**：在回复用户时，必须明确说出"我正在操作 **服务器X（conn_id @ IP，备注）**"
+   - 示例："我正在操作 **nas（192.168.10.6，NAS存储服务器）**，查看运行的服务..."
+
+4. **运维结果自带前缀**：所有运维工具返回结果会自动带 `[conn_id@host | 备注]` 前缀，便于识别
+
+5. **用户未指定服务器时必须询问**：当用户说"重启 nginx"但未指定哪台服务器，且有多台连接时，**必须先问**"请在哪台服务器操作？"并列出可用连接
+
+6. **危险操作二次确认**：stop/restart/disable 等危险操作，必须在回复中显示目标服务器完整信息让用户确认
+   - 示例："⚠️ 即将在 **web1（192.168.10.7，Web前端服务器）** 上执行 restart nginx，确认吗？"
 
 ### 4. 部署流程（ssh_deploy）
 deploy_config 必须包含以下字段：
