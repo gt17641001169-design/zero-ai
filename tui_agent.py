@@ -572,6 +572,18 @@ if not MODEL_CONFIGS["openrouter"]["api_key"]:
 OR_BASE = "https://openrouter.ai/api/v1"
 OR_KEY = MODEL_CONFIGS["openrouter"]["api_key"]
 
+# ====== 混合思考模式配置 ======
+# 专家并行度控制：最多同时调用的专家数（避免 token 暴涨）
+HYBRID_MAX_PARALLEL_EXPERTS = 3
+# 专家回答长度限制（字符数）：超过则截断，便于汇总
+HYBRID_EXPERT_MAX_CHARS = 800
+# 专家回答去重相似度阈值（0-1，Jaccard 相似度）：超过则视为重复
+HYBRID_DEDUP_SIMILARITY_THRESHOLD = 0.7
+# 专家记忆：每个专家保留的最近对话轮数（独立上下文，避免主上下文污染）
+EXPERT_MEMORY_TURNS = 3
+# 专家协作链：是否启用专家间结果传递（如 coder 写代码 → reasoner 审查）
+HYBRID_ENABLE_COLLAB_CHAIN = False  # 默认关闭，避免 token 消耗翻倍
+
 # 专家团队：每个专家对应一个模型配置
 EXPERT_TEAM = {
     "pm": {  # 项目经理（多模态，支持图片）
@@ -881,6 +893,42 @@ English abstract content.
 示例：用户说"帮我写一篇关于钠离子电池的5000字综述"
 → 先 literature_review 检索 → 撰写完整综述 → generate_word(path="D:/钠离子电池综述.docx", content=全文, title="层状氧化物钠离子电池正极材料研究进展", template="academic")""",
     },
+    "devops": {  # 运维专家（GLM-4.7-Flash，专精系统管理/SSH/容器/部署）
+        "label": "运维·GLM-4.7",
+        "model_key": "glm",
+        "model": "glm-4.7-flash",
+        "desc": "DevOps运维·系统管理·SSH·容器·部署·监控",
+        "keywords": ["运维", "部署", "服务器", "linux", "windows", "docker", "容器",
+                      "kubernetes", "k8s", "ssh", "shell", "bash", "powershell",
+                      "nginx", "apache", "systemd", "服务", "进程", "端口", "防火墙",
+                      "监控", "日志", "性能", "调优", "devops", "ci/cd", "jenkins",
+                      "ansible", "terraform", "负载均衡"],
+        "system_prompt": "你是 ZeroAI 的运维专家，专精 DevOps、系统管理、容器编排、CI/CD、监控告警、性能调优。给出可执行的命令和配置，必要时说明原理。优先使用项目内置的运维工具（local_port_check/local_process_check/local_disk_check/local_service_check/local_firewall_check/ssh_*）而非直接给命令。你是 ZeroAI，不是其他模型。",
+    },
+    "security": {  # 安全专家（GLM-4.7-Flash，专精漏洞分析/加固/审计）
+        "label": "安全·GLM-4.7",
+        "model_key": "glm",
+        "model": "glm-4.7-flash",
+        "desc": "安全分析·漏洞评估·加固方案·安全审计",
+        "keywords": ["安全", "漏洞", "攻击", "防护", "加固", "审计", "渗透",
+                      "xss", "sql注入", "csrf", "ssrf", "rce", "漏洞", "cve",
+                      "加密", "证书", "ssl", "tls", "密钥", "token", "权限",
+                      "认证", "授权", "owasp", "waf", "防火墙规则", "入侵检测",
+                      "security", "vulnerability", "pentest", "hardening"],
+        "system_prompt": "你是 ZeroAI 的安全专家，专精漏洞分析、安全加固、审计评估、加密方案。只做防御性安全分析，不提供攻击性建议。给出具体的加固命令、配置示例、修复方案。你是 ZeroAI，不是其他模型。",
+    },
+    "data": {  # 数据分析专家（GLM-4.7-Flash，专精数据处理/可视化/统计）
+        "label": "数据·GLM-4.7",
+        "model_key": "glm",
+        "model": "glm-4.7-flash",
+        "desc": "数据分析·统计建模·可视化·数据清洗",
+        "keywords": ["数据", "分析", "统计", "可视化", "图表", "pandas", "numpy",
+                      "matplotlib", "数据清洗", "数据预处理", "特征工程", "机器学习",
+                      "数据挖掘", "报表", "数据看板", "excel", "csv", "json",
+                      "sql查询", "数据分析", "dataframe", "数据分析", "bi",
+                      "数据分析", "回归", "聚类", "分类", "data", "analytics"],
+        "system_prompt": "你是 ZeroAI 的数据分析专家，专精数据清洗、统计分析、可视化、机器学习建模。给出可运行的 Python 代码（pandas/numpy/matplotlib/sklearn），必要时说明分析思路。你是 ZeroAI，不是其他模型。",
+    },
 }
 
 # 工作模式：expert（专家路由）/ hybrid（混合思考）/ manual（手动指定模型）
@@ -935,7 +983,7 @@ async def _interruptible_sleep(seconds: float, check_interval: float = 0.2):
 def route_expert(user_input: str) -> str:
     """关键词快速预判（作为GLM语义判断的降级方案）"""
     text = user_input.lower()
-    for expert_key in ("vision", "coder", "reasoner", "academic", "chinese", "pm"):
+    for expert_key in ("vision", "coder", "security", "devops", "data", "reasoner", "academic", "chinese", "pm"):
         for kw in EXPERT_TEAM[expert_key]["keywords"]:
             kw_lower = kw.lower()
             if kw_lower in text:
@@ -4909,6 +4957,52 @@ def _parse_think_tags(content: str) -> tuple:
     while body_content.startswith("\n"):
         body_content = body_content[1:]
     return think_content, body_content
+
+
+def _jaccard_similarity(s1: str, s2: str) -> float:
+    """计算两段文本的 Jaccard 相似度（基于字符 n-gram 集合）
+
+    用于专家回答去重：相似度越高说明回答越重复。
+    返回 0.0-1.0 的浮点数。
+    """
+    if not s1 or not s2:
+        return 0.0
+    # 使用 3-gram（兼顾中英文，对短文本也有效）
+    n = 3
+    if len(s1) < n or len(s2) < n:
+        # 文本过短时直接用字符集合
+        set1, set2 = set(s1), set(s2)
+    else:
+        set1 = {s1[i:i + n] for i in range(len(s1) - n + 1)}
+        set2 = {s2[i:i + n] for i in range(len(s2) - n + 1)}
+    if not set1 or not set2:
+        return 0.0
+    inter = len(set1 & set2)
+    union = len(set1 | set2)
+    return inter / union if union else 0.0
+
+
+def _truncate_expert_response(text: str, max_chars: int) -> str:
+    """截断专家回答到指定字符数，并附加截断提示
+
+    用于 HYBRID_EXPERT_MAX_CHARS 限制：避免单个专家回答过长导致汇总 token 暴涨。
+    """
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    # 在 max_chars 附近找换行或句号，避免截断在词中间
+    cut = text[:max_chars]
+    # 优先在最近的换行处截断
+    nl = cut.rfind("\n")
+    if nl > max_chars * 0.7:
+        cut = cut[:nl]
+    else:
+        # 退而求其次在句号/问号处截断
+        for sep in ("。", "？", "！", ".", "?", "!"):
+            sp = cut.rfind(sep)
+            if sp > max_chars * 0.7:
+                cut = cut[:sp + 1]
+                break
+    return cut + "\n\n…（专家回答已截断，仅汇总关键部分）"
 
 
 def render_latex_in_text(text: str) -> str:
@@ -12095,6 +12189,9 @@ class ZeroAI(App):
         self._is_generating = False
         # 最近一次助手回复的纯文本（用于复制）
         self._last_reply_text = ""
+        # 专家记忆：每个专家维护独立上下文，避免主上下文污染
+        # 结构：{expert_key: [{"role": "user"|"assistant", "content": "..."}, ...]}
+        self._expert_memory = {}
         # 待发送的图片 base64 列表（Ctrl+V 粘贴）
         self._pending_images = []
         # 伴随模式（屏幕感知）
@@ -13267,10 +13364,13 @@ class ZeroAI(App):
 - chinese: 中文写作/文案
 - knowledge: 通用知识/翻译
 - vision: 图片理解
+- devops: 运维/部署/系统管理/容器/SSH
+- security: 安全分析/漏洞评估/加固
+- data: 数据分析/统计/可视化
 
 用户需求：{last_user[:500]}
 
-请只回复专家标识，用逗号分隔（最多3个），例如：coder,reasoner
+请只回复专家标识，用逗号分隔（最多{HYBRID_MAX_PARALLEL_EXPERTS}个），例如：coder,reasoner
 不要回复其他内容。"""
 
         try:
@@ -13298,8 +13398,8 @@ class ZeroAI(App):
         if not expert_keys:
             # 降级：用关键词路由
             expert_keys = [route_expert(last_user)]
-        # 最多3个专家
-        expert_keys = expert_keys[:3]
+        # 专家并行度控制：限制最多并行专家数（避免 token 暴涨）
+        expert_keys = expert_keys[:HYBRID_MAX_PARALLEL_EXPERTS]
 
         analysis_md = f"**任务分析**\n\n需要 {len(expert_keys)} 位专家协作：\n"
         for ek in expert_keys:
@@ -13328,16 +13428,31 @@ class ZeroAI(App):
             expert_blocks[ek] = block_e
 
         # 单个专家调用协程（并行任务单元）
-        async def _call_expert(ek: str) -> dict:
-            """并行调用单个专家，返回 {"expert": label, "content": text} 或 None"""
+        async def _call_expert(ek: str, user_msg: str = None) -> dict:
+            """并行调用单个专家，返回 {"expert": label, "content": text} 或 None
+
+            集成三项优化：
+            - 专家记忆：加载/保存独立上下文（EXPERT_MEMORY_TURNS），避免主上下文污染
+            - 失败降级：任何异常都返回 None，不阻断整体协作流程
+            - 长度限制：最终回答截断到 HYBRID_EXPERT_MAX_CHARS，便于汇总
+            - 协作链：user_msg 可传入前一位专家的结果（默认用 last_user）
+            """
             # 检查是否已被 Ctrl+C 停止
             if self._stop_generation:
                 return None
+            # 协作链支持：允许传入自定义用户消息（含前一位专家结果）
+            actual_user_msg = user_msg if user_msg is not None else last_user
             expert = EXPERT_TEAM[ek]
             e_cfg = get_expert_config(ek)
             block_e = expert_blocks[ek]
 
-            # ── 标准单模型调用（带超时重试） ──
+            # ── 构建消息列表（含专家记忆：独立上下文，避免主上下文污染） ──
+            sys_msg = {"role": "system", "content": TOOL_CAPABILITY_PROMPT + "\n\n" + expert.get("system_prompt", "你是 ZeroAI 专家团队成员，从专业角度回答用户问题。")}
+            # 加载专家记忆（最近 EXPERT_MEMORY_TURNS 轮对话，每轮=用户问+专家答=2条消息）
+            memory = self._expert_memory.get(ek, [])
+            e_messages = [sys_msg] + list(memory) + [{"role": "user", "content": actual_user_msg}]
+
+            # ── 标准单模型调用（带超时重试 + 失败降级） ──
             max_tries = 3  # hybrid 模式：最多重试 3 次
             e_stream = None
             for _try in range(max_tries):
@@ -13352,8 +13467,7 @@ class ZeroAI(App):
                         )
                     e_stream = await e_client.chat.completions.create(
                         model=e_cfg["model"],
-                        messages=[{"role": "system", "content": TOOL_CAPABILITY_PROMPT + "\n\n" + expert.get("system_prompt", "你是 ZeroAI 专家团队成员，从专业角度回答用户问题。")},
-                                  {"role": "user", "content": last_user}],
+                        messages=e_messages,
                         temperature=self.temperature,
                         stream=self.stream_enabled,
                         timeout=180,
@@ -13375,8 +13489,15 @@ class ZeroAI(App):
                         if self._stop_generation:
                             return None
                         continue
-                    raise retry_e
+                    # 失败降级：重试耗尽或不可重试异常，跳过该专家而非整个流程失败
+                    block_e.update(Text.assemble(
+                        (f"  ├─ {expert['label']}\n", f"bold {C_FG}"),
+                        ("  │ ", C_DIM),
+                        (f"⚠ 调用失败，已跳过该专家：{str(retry_e)[:80]}\n", f"bold {C_YELLOW}"),
+                    ))
+                    return None
             if e_stream is None:
+                # 失败降级：未获取到流，跳过
                 return None
             try:
                 e_content = ""
@@ -13424,32 +13545,109 @@ class ZeroAI(App):
                     self._update_streaming(block_e, body, final=True)
                 # 后续使用 body（已去除 <think> 标签）
                 e_content = body
+
+                # ── 专家回答长度限制：截断到 HYBRID_EXPERT_MAX_CHARS，便于汇总 ──
+                if HYBRID_EXPERT_MAX_CHARS > 0 and len(e_content) > HYBRID_EXPERT_MAX_CHARS:
+                    e_content = _truncate_expert_response(e_content, HYBRID_EXPERT_MAX_CHARS)
+
                 if e_content.strip():
-                    return {"expert": expert["label"], "content": e_content}
+                    # ── 保存到专家记忆（独立上下文，避免主上下文污染） ──
+                    if EXPERT_MEMORY_TURNS > 0:
+                        memory.append({"role": "user", "content": actual_user_msg})
+                        memory.append({"role": "assistant", "content": e_content})
+                        # 仅保留最近 EXPERT_MEMORY_TURNS 轮（每轮 2 条消息）
+                        max_msgs = EXPERT_MEMORY_TURNS * 2
+                        if len(memory) > max_msgs:
+                            memory = memory[-max_msgs:]
+                        self._expert_memory[ek] = memory
+                    return {"expert": expert["label"], "content": e_content, "expert_key": ek}
                 return None
             except Exception as e:
-                err_msg = f"  {expert['label']} 调用失败：{str(e)[:100]}\n"
-                self._add_static(Text(err_msg, style=C_DIM))
+                # 失败降级：流处理过程中的异常，跳过该专家而非整个流程失败
+                err_msg = f"  ⚠ {expert['label']} 调用失败，已跳过：{str(e)[:80]}\n"
+                try:
+                    block_e.update(Text(err_msg, style=C_DIM))
+                except Exception:
+                    self._add_static(Text(err_msg, style=C_DIM))
                 return None
             finally:
                 self._add_static(Text("  └─", style=C_DIM))
 
-        # 并行执行所有专家调用（return_exceptions=True 防止单个失败影响整体）
-        parallel_results = await asyncio.gather(
-            *[_call_expert(ek) for ek in expert_keys],
-            return_exceptions=True,
-        )
+        # ── 执行专家调用：协作链（顺序）或并行 ──
+        # 专家协作链：支持专家间传递结果（如 coder 写代码 → reasoner 审查逻辑 → academic 补充引用）
+        # 默认关闭（HYBRID_ENABLE_COLLAB_CHAIN=False），避免 token 消耗翻倍
+        if HYBRID_ENABLE_COLLAB_CHAIN and len(expert_keys) > 1:
+            # 协作链模式：顺序调用，每个后续专家能看到前一位专家的回答
+            self._add_static(Text("  🔗 协作链模式：专家依次回答并传递结果\n", style=C_DIM))
+            expert_responses = []
+            prev_response = ""
+            for ek in expert_keys:
+                if self._stop_generation:
+                    break
+                # 将前一位专家的回答注入本次用户问题，形成协作链
+                if prev_response:
+                    chain_user_msg = (
+                        f"{last_user}\n\n"
+                        f"── 上一环节专家（{EXPERT_TEAM[expert_keys[0]]['label']}）的回答 ──\n"
+                        f"{prev_response[:HYBRID_EXPERT_MAX_CHARS]}\n"
+                        f"── 请在此基础上从你的专业角度补充/审查/完善 ──"
+                    )
+                else:
+                    chain_user_msg = last_user
+                # 通过 user_msg 参数传递协作链上下文
+                result = await _call_expert(ek, chain_user_msg)
+                if isinstance(result, dict) and result.get("content"):
+                    expert_responses.append(result)
+                    prev_response = result["content"]
+                # 协作链中某专家失败：降级跳过，继续下一个专家（不阻断链）
+            parallel_results = expert_responses  # 统一变量名
+        else:
+            # 并行模式：所有专家同时调用（默认，token 效率最优）
+            parallel_results = await asyncio.gather(
+                *[_call_expert(ek) for ek in expert_keys],
+                return_exceptions=True,
+            )
 
         # 收集成功的回复
         expert_responses = []
-        for result in parallel_results:
-            if isinstance(result, dict) and result.get("content"):
-                expert_responses.append(result)
+        if HYBRID_ENABLE_COLLAB_CHAIN and len(expert_keys) > 1:
+            # 协作链模式：parallel_results 已经是 list[dict]
+            for result in parallel_results:
+                if isinstance(result, dict) and result.get("content"):
+                    expert_responses.append(result)
+        else:
+            # 并行模式：parallel_results 是 gather 的返回（含异常）
+            for result in parallel_results:
+                if isinstance(result, dict) and result.get("content"):
+                    expert_responses.append(result)
 
         if not expert_responses:
             self._add_static(Text(f"  {_load_svg_icon('cross')} 所有专家调用失败\n", style=C_FG))
             self._is_generating = False
             return
+
+        # ── 专家去重：基于 Jaccard 相似度过滤高度相似的回答 ──
+        # 场景：项目经理选了 coder + reasoner，但两者回答高度相似，汇总时去重以减少 token
+        if HYBRID_DEDUP_SIMILARITY_THRESHOLD > 0 and len(expert_responses) > 1:
+            unique_responses = [expert_responses[0]]
+            dedup_skipped = []
+            for resp in expert_responses[1:]:
+                is_dup = False
+                for kept in unique_responses:
+                    sim = _jaccard_similarity(resp["content"], kept["content"])
+                    if sim >= HYBRID_DEDUP_SIMILARITY_THRESHOLD:
+                        is_dup = True
+                        dedup_skipped.append((resp["expert"], kept["expert"], round(sim, 2)))
+                        break
+                if not is_dup:
+                    unique_responses.append(resp)
+            if len(dedup_skipped) > 0:
+                # 显示去重提示
+                dedup_msg = "  ℹ 去重："
+                dedup_parts = [f"{a}≈{b}({s})" for a, b, s in dedup_skipped]
+                dedup_msg += "，".join(dedup_parts) + " 已合并\n"
+                self._add_static(Text(dedup_msg, style=C_DIM))
+            expert_responses = unique_responses
 
         # ── 第3步：项目经理GLM汇总 ──
         if self._stop_generation or len(expert_responses) <= 1:
