@@ -604,12 +604,12 @@ EXPERT_TEAM = {
                       "sql", "api", "写一个", "实现", "debug", "code", "function", "class", "脚本"],
         "system_prompt": "你是 ZeroAI 的编程专家，专精代码生成、调试、重构、架构设计。直接给出可运行的代码，必要时简短说明思路。你是 ZeroAI，不是其他模型。",
     },
-    "reasoner": {  # 推理专家（内置免费模型，label 不显示具体模型名以符合 UI 规则）
-        # 实际模型：nvidia/nemotron-3-ultra-550b-a55b:free（OpenRouter 免费供应）
-        "label": "推理·内置",
-        "model_key": "openrouter",
-        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "desc": "深度推理·数学·逻辑（内置免费模型）",
+    "reasoner": {  # 推理专家（GLM-4.7-Flash，智谱直供稳定；OpenRouter Key 失效后切换）
+        # 备份原配置：model_key="openrouter", model="nvidia/nemotron-3-ultra-550b-a55b:free"（Key 已失效 401）
+        "label": "推理·GLM-4.7",
+        "model_key": "glm",
+        "model": "glm-4.7-flash",
+        "desc": "深度推理·数学·逻辑（GLM-4.7-Flash·智谱直供·免费无限）",
         "keywords": ["推理", "证明", "数学", "计算", "逻辑", "为什么", "分析原因", "算法",
                       "复杂", "优化", "证明", "solve", "math", "reason"],
         "system_prompt": "你是 ZeroAI 的推理专家，专精深度推理、数学证明、复杂逻辑分析。给出严谨的推理过程和结论。你是 ZeroAI，不是其他模型。",
@@ -622,12 +622,12 @@ EXPERT_TEAM = {
         "keywords": [],  # 默认兜底
         "system_prompt": "你是 ZeroAI 的通用知识专家，负责回答百科类问题、事实查询、翻译等。给出准确、简洁的回答。",
     },
-    "chinese": {  # 中文专家（内置免费模型，label 不显示具体模型名以符合 UI 规则）
-        # 实际模型：nvidia/nemotron-3-nano-30b-a3b:free（OpenRouter 免费供应）
-        "label": "中文·内置",
-        "model_key": "openrouter",
-        "model": "nvidia/nemotron-3-nano-30b-a3b:free",
-        "desc": "中文写作·文案·报告（内置免费模型）",
+    "chinese": {  # 中文专家（GLM-4.7-Flash，智谱直供稳定；OpenRouter Key 失效后切换）
+        # 备份原配置：model_key="openrouter", model="nvidia/nemotron-3-nano-30b-a3b:free"（Key 已失效 401）
+        "label": "中文·GLM-4.7",
+        "model_key": "glm",
+        "model": "glm-4.7-flash",
+        "desc": "中文写作·文案·报告（GLM-4.7-Flash·智谱直供·免费无限）",
         "keywords": ["写", "作文", "文章", "报告", "文案", "论文", "小说", "故事", "邮件",
                       "摘要", "润色", "写作", "中文"],
         "system_prompt": "你是 ZeroAI 的中文写作专家，专精文章、报告、文案、邮件、润色。直接输出高质量中文内容。你是 ZeroAI，不是其他模型。",
@@ -13623,6 +13623,8 @@ class ZeroAI(App):
 
         if not expert_responses:
             self._add_static(Text(f"  {_load_svg_icon('cross')} 所有专家调用失败\n", style=C_FG))
+            # 复制修复：即使所有专家失败，也保存错误提示到 _last_reply_text，避免 Ctrl+Y 显示"无内容可复制"
+            self._last_reply_text = "（所有专家调用失败，请检查网络或 API Key 后重试）"
             self._is_generating = False
             return
 
@@ -13708,6 +13710,9 @@ class ZeroAI(App):
                             self._update_streaming_with_reasoning(block_sum, body, combined)
                         else:
                             self._update_streaming(block_sum, body)
+                        # 复制修复：流式汇总过程中实时更新 _last_reply_text，确保中途停止也能复制
+                        if body.strip():
+                            self._last_reply_text = body
                         await asyncio.sleep(0)
             else:
                 # stream=False：用可中断 await 包装
@@ -13719,6 +13724,9 @@ class ZeroAI(App):
                     stream=False,
                 ))
                 if sum_resp is None or self._stop_generation:
+                    # 复制修复：汇总被停止时，保存已有内容（流式模式下 _last_reply_text 已实时更新）
+                    if not self._last_reply_text.strip() and expert_responses:
+                        self._last_reply_text = expert_responses[0]["content"]
                     self._is_generating = False
                     self._add_static(Text("  ⏹ 已停止\n", style=C_DIM))
                     return
