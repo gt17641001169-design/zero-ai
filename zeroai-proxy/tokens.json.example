@@ -1,0 +1,43 @@
+{
+  "_说明": "ZeroAI Proxy Token 配置文件。修改后自动热重载，无需重启服务。删除某个 Token 即吊销；设置 revoked=true 也可吊销。",
+  "_字段说明": {
+    "user": "Token 归属用户名（用于日志和统计）",
+    "team": "所属团队（如 开发团队/测试团队）",
+    "revoked": "false=正常，true=已吊销（吊销后立即生效，无需重启）",
+    "expires": "null=永久有效，'2026-12-31T23:59:59'=指定过期时间",
+    "usage_count": "程序自动更新的调用计数，请勿手动修改",
+    "last_used": "程序自动更新的最后使用时间，请勿手动修改",
+    "created_at": "Token 创建时间（可选，仅记录用）"
+  },
+  "_生成方式": "python -c \"import secrets; print(secrets.token_urlsafe(32))\"",
+
+  "请替换为你的Token_1": {
+    "user": "张三",
+    "team": "开发团队",
+    "revoked": false,
+    "expires": null,
+    "usage_count": 0,
+    "last_used": null,
+    "created_at": "2026-07-25T00:00:00"
+  },
+
+  "请替换为你的Token_2": {
+    "user": "李四",
+    "team": "测试团队",
+    "revoked": false,
+    "expires": "2026-12-31T23:59:59",
+    "usage_count": 0,
+    "last_used": null,
+    "created_at": "2026-07-25T00:00:00"
+  },
+
+  "请替换为你的Token_3_已吊销示例": {
+    "user": "离职员工",
+    "team": "前开发团队",
+    "revoked": true,
+    "expires": null,
+    "usage_count": 152,
+    "last_used": "2026-07-20T14:30:00",
+    "created_at": "2026-06-01T09:00:00"
+  }
+}

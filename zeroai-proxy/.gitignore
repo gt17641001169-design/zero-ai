@@ -5,3 +5,20 @@ logs/
 .venv/
 venv/
 *.log
+
+# 安全相关（证书和 Token 文件，绝不进 Git）
+*.pem
+*.key
+*.crt
+tokens.json
+cert.pem
+cert.key
+*.bak.*
+
+# 服务器实际配置（含真实 API Key 和 Token，绝不进 Git）
+.env.server
+.env.production
+.env.live
+tokens.json.server
+tokens.json.production
+tokens.json.live

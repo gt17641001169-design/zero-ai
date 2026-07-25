@@ -4,7 +4,7 @@
 
 ### 面向科研与工程的终端 AI 协作平台
 
-**多专家协同 · 学术文献检索 · 国标文档生成 · 安全审计 · SSH 远程运维**
+**多专家协同 · 学术文献检索 · 国标文档生成 · 安全审计 · SSH 跨平台运维 · 本地运维**
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-green.svg)]()
@@ -122,9 +122,9 @@ ZeroAI 是一个面向科研工作者与开发者的终端 AI 协作平台。系
 - 审计日志（最多 200 条），可追溯
 - 主机地址校验、危险命令黑名单、内网IP可选阻断、输出截断保护
 
-### AI 远程运维（8 个语义化工具）
+### AI 远程运维（8 个语义化工具，跨平台）
 
-将"AI 拼命令"升级为"AI 调用语义化工具"，减少幻觉、统一错误处理、自动分析结果：
+将"AI 拼命令"升级为"AI 调用语义化工具"，减少幻觉、统一错误处理、自动分析结果。8 个工具全部支持 **Linux + Windows Server 跨平台自动适配**：
 
 | 工具 | 功能 |
 |------|------|
@@ -142,6 +142,60 @@ ZeroAI 是一个面向科研工作者与开发者的终端 AI 协作平台。系
 - 模糊问题处理："服务器卡了" → 先体检 → 再深入 → 定位 → 给建议
 - 明确故障排错："nginx 挂了" → 看 status → 若 failed → 查 error 日志 → 定位根因
 - AI 主动分析：体检报告自动识别负载/磁盘/Swap/失败服务/错误日志异常项
+
+### SSH 跨平台运维（Linux + Windows Server）
+
+8 个 AI 远程运维工具全部支持**跨平台自动适配**，连接后自动检测远程操作系统，无需用户指定命令语法：
+
+| 工具 | Linux 实现 | Windows 实现 |
+|------|-----------|-------------|
+| `ssh_service_manage` | `systemctl` | `sc.exe` / `Get-Service` |
+| `ssh_log_view` | `journalctl` | `Get-WinEvent`（事件日志） |
+| `ssh_process_check` | `ps aux` | `Get-Process` |
+| `ssh_disk_analyze` | `df` + `du` | `Get-CimInstance` + `Get-ChildItem` Top10 |
+| `ssh_network_diag` | `ss` / `netstat` | `Get-NetTCPConnection` |
+| `ssh_docker_manage` | 原生 Docker CLI | Docker Desktop（`docker.exe`） |
+| `ssh_firewall_manage` | `ufw` / `firewalld` / `iptables` | `netsh advfirewall` |
+| `ssh_health_check` | 综合体检（自动检测 OS） | 综合体检（Windows Server 指标） |
+
+**跨平台价值**：
+- 同一套自然语言指令可管理 Linux 和 Windows 服务器："看 nginx 状态" 在两端都能正确执行
+- 运维人员无需记忆两套命令语法，降低跨平台运维门槛
+- 工具内部处理命令差异，AI 无需拼命令，减少幻觉
+
+### 本地运维工具（4 个语义化工具，跨平台）
+
+将常用的本地电脑运维操作封装为语义化工具，自动适配 Windows/Linux，**优先于 `run_command` 手拼命令调用**：
+
+| 工具 | 功能 | 典型场景 |
+|------|------|---------|
+| `local_port_check` | 端口/网络检查 | "看看打开了哪些端口"、"80 端口被占了吗"、"ping 一下 192.168.1.1" |
+| `local_process_check` | 进程查看/管理 | "电脑卡不卡"、"查 chrome 进程"、"结束 PID 1234" |
+| `local_disk_check` | 磁盘空间分析 | "磁盘还剩多少"、"哪个目录占空间最大"、"C 盘满了" |
+| `local_service_check` | 服务管理 | "查看运行的服务"、"MySQL 状态"、"重启 docker 服务" |
+
+**安全设计**：
+- 防注入白名单：进程名/服务名仅允许字母、数字、`.`、`_`、`-`，拒绝 `nginx; rm -rf /` 类注入
+- 端口检查用 socket 连接探测，不依赖外部命令
+- 危险操作（kill/stop）需明确参数
+
+### 跨平台命令兼容性（run_command 自动翻译）
+
+`run_command` 工具内置 **Linux ↔ Windows 命令翻译引擎**，用户可输入任意平台命令，系统自动适配当前操作系统：
+
+```
+用户在 Windows 上输入 'ls -la'      → 自动执行 'dir -la'
+用户在 Windows 上输入 'cat file'    → 自动执行 'type file'
+用户在 Windows 上输入 'rm -rf /tmp' → 自动执行 'rmdir /s /q /tmp'
+用户在 Windows 上输入 'grep x file' → 自动执行 'findstr x file'
+用户在 Windows 上输入 'ps aux'      → 自动执行 'tasklist aux'
+```
+
+**翻译特性**：
+- **50+ 命令映射**：覆盖文件操作、网络、服务、进程、包管理等常用命令
+- **最长匹配优先**：`rm -rf` 优先于 `rm` 匹配，避免误翻译
+- **智能跳过**：原命令已是目标平台格式（如 `netstat -ano`）时自动跳过翻译，避免重复
+- **翻译提示**：翻译后输出 `[跨平台] 已将 'ls' 翻译为 'dir'` 提示用户
 
 ### 语音对话
 
@@ -310,6 +364,99 @@ zeroai
 | 流式透传 | 完整支持 SSE，流式输出不受影响 |
 | OpenAI 兼容 | 客户端无需改造 SDK，只需改 base_url |
 | 日志审计 | 记录 IP/Token/模型/状态，便于追溯 |
+
+### IP 安全设计（v1.2.0 安全加固）
+
+针对代理服务器在团队/内网部署场景下的安全威胁，v1.2.0 版本进行了系统性的 IP 与 Token 安全加固：
+
+#### 1. Token 归属与生命周期管理
+
+| 能力 | 说明 |
+|------|------|
+| Token 归属 | 每个 Token 绑定用户名、团队、备注，便于审计追溯 |
+| 用量统计 | 自动记录调用次数、最后使用时间 |
+| 过期时间 | 支持永久 Token 或指定过期时间（ISO 8601 格式） |
+| 即时吊销 | 修改 `tokens.json` 后**热重载生效**，无需重启服务 |
+| 状态恢复 | 已吊销的 Token 可恢复使用 |
+| 统计重置 | 可重置 Token 的用量计数 |
+| 管理端点 | `/admin/tokens` 查看、`/admin/revoke` 吊销（需 ADMIN_TOKEN） |
+
+Token 文件格式（`tokens.json`）：
+```json
+{
+  "abc123def456...": {
+    "user": "张三",
+    "team": "开发团队",
+    "revoked": false,
+    "expires": null,
+    "usage_count": 0,
+    "last_used": null,
+    "created_at": "2026-07-25T10:00:00"
+  }
+}
+```
+
+#### 2. 暴力破解防护
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `MAX_FAILURES` | 5 | 同一 IP 连续失败 N 次触发封禁 |
+| `BAN_MINUTES` | 30 | 封禁时长（分钟） |
+| `BAN_WINDOW_MINUTES` | 10 | 失败计数窗口（分钟） |
+
+- 同一 IP 在 10 分钟窗口内连续失败 5 次 → 自动封禁 30 分钟
+- 验证成功后自动清除该 IP 的失败记录
+- 封禁列表可通过 `/admin/banned` 查看（需 ADMIN_TOKEN）
+
+#### 3. HTTPS 加密传输（自签证书）
+
+- 生成自签证书：`python generate_cert.py`（基于 `cryptography` 库）
+- 启用后 Token 加密传输，防中间人嗅探
+- 客户端配置 `verify_ssl=false` 接受自签证书（内网部署场景）
+- 证书文件（`cert.pem` / `cert.key`）通过 `.gitignore` 排除，不入版本库
+
+#### 4. API 文档端点关闭
+
+| 端点 | 状态 | 说明 |
+|------|------|------|
+| `/docs` | 关闭 | Swagger UI 不暴露 |
+| `/redoc` | 关闭 | ReDoc 不暴露 |
+| `/openapi.json` | 关闭 | OpenAPI schema 不泄露接口结构 |
+
+防止攻击者通过 API 文档探测系统接口与参数。
+
+#### 5. IP 脱敏审计日志
+
+所有日志中的 IP 地址自动脱敏，仅保留前两段：
+```
+原 IP：192.168.10.66  →  日志：192.168.xxx.xxx
+```
+- 保护用户隐私，便于内部审计
+- 封禁/解封日志同样脱敏
+
+#### 6. 管理端点鉴权
+
+`/admin/*` 端点需 `ADMIN_TOKEN` 鉴权（独立于客户端 Token）：
+- `/admin/tokens`：列出所有 Token（脱敏）
+- `/admin/revoke`：吊销指定 Token
+- `/admin/reinstate`：恢复已吊销 Token
+- `/admin/banned`：查看当前封禁 IP 列表
+- `/admin/unban`：解封指定 IP
+
+#### 7. .gitignore 安全排除
+
+```gitignore
+# 安全相关（证书和 Token 文件，绝不进 Git）
+*.pem
+*.key
+*.crt
+tokens.json
+cert.pem
+cert.key
+*.bak.*
+```
+
+确保敏感文件不会误提交到版本库。
 
 详细部署文档见 [zeroai-proxy/README.md](zeroai-proxy/README.md)。
 

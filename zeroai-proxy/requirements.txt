@@ -3,3 +3,6 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 httpx>=0.27
 python-dotenv>=1.0
+
+# HTTPS 自签证书生成（可选，仅 generate_cert.py 需要）
+cryptography>=42.0

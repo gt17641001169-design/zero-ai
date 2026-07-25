@@ -1577,13 +1577,159 @@ def list_dir(path: str = ".", recursive: bool = False, max_depth: int = 15) -> s
         return f"错误：{e}"
 
 
-def run_command(command: str) -> str:
-    """全权限模式：执行任意命令，无黑名单限制"""
+def _is_windows_local() -> bool:
+    """检测本地操作系统是否为 Windows"""
+    return sys.platform == "win32" or os.name == "nt"
+
+
+# 跨平台命令映射表：Linux 命令 → Windows 等效命令
+# 当用户在 Windows 上输入 Linux 命令时，自动转换为对应的 Windows 命令
+_CROSS_PLATFORM_COMMAND_MAP = {
+    # 列表/查看类
+    "ls": "dir",
+    "ll": "dir /Q",
+    "la": "dir /A",
+    "cat": "type",
+    "less": "more",
+    "head": "more",       # 简化映射，PowerShell 下可用 Select-Object -First
+    "tail": "more",       # 简化映射
+    "grep": "findstr",
+    "find": "findstr",    # 注意：Windows 的 find 和 Linux 的 find 含义不同
+    "which": "where",
+    "whereis": "where",
+    "echo": "echo",
+    "pwd": "cd",
+    "whoami": "whoami",
+    "hostname": "hostname",
+    "date": "date /t",
+    "uptime": "net statistics workstation",
+    "uname": "ver",
+    "df": "wmic logicaldisk get name,size,freespace",
+    "du": "dir /s",
+    "free": "wmic OS get TotalVisibleMemorySize,FreePhysicalMemory",
+    "top": "tasklist",
+    "ps": "tasklist",
+    "kill": "taskkill /PID",
+    "killall": "taskkill /IM",
+    # 网络
+    "ifconfig": "ipconfig",
+    "ip addr": "ipconfig",
+    "netstat": "netstat -ano",
+    "ss": "netstat -ano",
+    "ping": "ping",
+    "traceroute": "tracert",
+    "tracepath": "tracert",
+    "nslookup": "nslookup",
+    "dig": "nslookup",
+    "host": "nslookup",
+    "curl": "curl",       # Windows 10+ 自带
+    "wget": "curl -O",    # Windows 10+ 用 curl 替代
+    # 服务
+    "systemctl": "sc",    # 简化映射，实际语义不完全等价
+    "service": "sc",
+    # 文件操作
+    "rm": "del",
+    "rm -rf": "rmdir /s /q",
+    "rmdir": "rmdir /s /q",
+    "mkdir": "mkdir",
+    "mv": "move",
+    "cp": "copy",
+    "touch": "type nul >",
+    "chmod": "icacls",    # 权限管理
+    "chown": "icacls",
+    # 文本处理（近似映射）
+    "sed": "powershell -Command (Get-Content).Replace()",
+    "awk": "powershell -Command",
+    "sort": "sort",
+    "uniq": "sort /unique",
+    "wc": "find /c /v \"\"",
+    # 包管理
+    "apt": "winget",
+    "apt-get": "winget",
+    "yum": "winget",
+    "dnf": "winget",
+    "pip": "pip",
+    "python3": "python",
+    # 其他
+    "history": "doskey /history",
+    "env": "set",
+    "export": "set",
+}
+
+
+def _translate_command(command: str) -> tuple:
+    """跨平台命令翻译：把 Linux 命令转换为 Windows 等效命令（或反之）。
+
+    Returns:
+        (translated_command, is_translated)
+        - translated_command: 翻译后的命令（如无需翻译则返回原命令）
+        - is_translated: 是否发生了翻译
+    """
+    if not command or not command.strip():
+        return command, False
+
+    cmd = command.strip()
+    # 取第一个词（命令本身，不含参数）
+    parts = cmd.split(None, 1)
+    if not parts:
+        return command, False
+
+    base_cmd = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+
+    # 在 Windows 上：Linux → Windows
+    if _is_windows_local():
+        cmd_lower = cmd.lower()
+        # 优先检查：原命令是否已经是 Windows 格式（以某个 value 开头）
+        # 避免 "netstat -ano | findstr ..." 被重复翻译为 "netstat -ano -ano | findstr ..."
+        for win_cmd in _CROSS_PLATFORM_COMMAND_MAP.values():
+            win_lower = win_cmd.lower()
+            if cmd_lower == win_lower or cmd_lower.startswith(win_lower + " "):
+                return command, False  # 已经是 Windows 命令，不翻译
+        # 完整短语匹配优先（按 key 长度降序，确保 "rm -rf" 在 "rm" 之前匹配）
+        for linux_cmd in sorted(_CROSS_PLATFORM_COMMAND_MAP.keys(), key=len, reverse=True):
+            win_cmd = _CROSS_PLATFORM_COMMAND_MAP[linux_cmd]
+            if cmd_lower == linux_cmd:
+                return win_cmd, True
+            if cmd_lower.startswith(linux_cmd + " "):
+                # 去掉整个匹配短语作为 rest，保留剩余参数
+                suffix = cmd[len(linux_cmd):].strip()
+                translated = f"{win_cmd} {suffix}" if suffix else win_cmd
+                return translated, True
+        # 单词匹配（兜底）
+        if base_cmd in _CROSS_PLATFORM_COMMAND_MAP:
+            win_cmd = _CROSS_PLATFORM_COMMAND_MAP[base_cmd]
+            if rest:
+                return f"{win_cmd} {rest}", True
+            return win_cmd, True
+
+    return command, False
+
+
+def run_command(command: str, skip_translate: bool = False) -> str:
+    """全权限模式：执行任意命令，无黑名单限制
+
+    跨平台支持：自动识别 Linux 命令并转换为 Windows 等效命令（或反之）。
+    例如在 Windows 上输入 'ls' 会自动转换为 'dir'，'cat file' 转换为 'type file'。
+
+    Args:
+        command: 要执行的命令
+        skip_translate: 跳过跨平台翻译（语义化本地运维工具内部已适配，传 True 避免误翻译）
+    """
     # 危险命令黑名单（仅受限模式生效）
     dangerous = ["rm -rf /", "del /f /s /q C:\\", "format C:", "shutdown /s /t 0"]
     if PERMISSION_LEVEL != "full":
         if any(d in command.lower() for d in dangerous):
             return "已拦截危险命令（受限模式）"
+
+    # 跨平台命令翻译（语义化工具已内部适配，跳过）
+    original_command = command
+    translate_hint = ""
+    if not skip_translate:
+        command, is_translated = _translate_command(command)
+        if is_translated:
+            translate_hint = f"[跨平台] 已将 '{original_cmd_safe(original_command)}' 翻译为 '{command}'\n"
+
     try:
         # 全权限：超时延长到 120 秒；受限：30 秒
         timeout = 120 if PERMISSION_LEVEL == "full" else 30
@@ -1598,11 +1744,264 @@ def run_command(command: str) -> str:
         out = (r.stdout or "") + (r.stderr or "")
         # 全权限：返回更长（8000）；受限：4000
         max_out = 8000 if PERMISSION_LEVEL == "full" else 4000
-        return out.strip()[:max_out] if out.strip() else "(无输出)"
+        result = out.strip()[:max_out] if out.strip() else "(无输出)"
+        return translate_hint + result
     except subprocess.TimeoutExpired:
-        return f"错误：命令超时（>{timeout}秒）"
+        return f"{translate_hint}错误：命令超时（>{timeout}秒）"
     except Exception as e:
-        return f"错误：{e}"
+        return f"{translate_hint}错误：{e}"
+
+
+def original_cmd_safe(cmd: str) -> str:
+    """对原始命令做简单脱敏（避免控制字符）"""
+    return cmd[:200].replace("\n", " ").replace("\r", " ")
+
+
+# ====== 语义化本地运维工具集（4个，跨平台）======
+def local_port_check(action: str = "list", port: int = 0,
+                     protocol: str = "tcp", target: str = "") -> str:
+    r"""本地端口/网络检查工具（跨平台：Windows/Linux 自动适配）。
+
+    Args:
+        action: 操作类型：
+            - list: 列出所有监听端口（默认）
+            - check: 检查指定端口是否被占用（需 port 参数）
+            - ping: ping 目标主机（需 target 参数）
+            - connections: 查看活跃 TCP 连接
+        port: 端口号（action=check 时必填）
+        protocol: 协议（tcp/udp），默认 tcp
+        target: 目标主机/IP（action=ping 时必填）
+
+    Returns:
+        端口/网络检查结果
+    """
+    import socket
+
+    if action == "list":
+        if _is_windows_local():
+            cmd = "netstat -ano | findstr LISTENING"
+        else:
+            cmd = "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null"
+        return run_command(cmd)
+
+    elif action == "check":
+        if not port:
+            return "错误：action=check 需要 port 参数"
+        # 跨平台端口占用检查
+        try:
+            sock_type = socket.SOCK_STREAM if protocol.lower() == "tcp" else socket.SOCK_DGRAM
+            s = socket.socket(socket.AF_INET, sock_type)
+            s.settimeout(1)
+            result = s.connect_ex(("127.0.0.1", port))
+            s.close()
+            if result == 0:
+                # 端口被占用，查询占用进程
+                if _is_windows_local():
+                    proc_cmd = f"netstat -ano | findstr :{port}"
+                    proc_out = run_command(proc_cmd, skip_translate=True)
+                    return f"⚠️ 端口 {port}/{protocol} 已被占用\n\n{proc_out}"
+                else:
+                    proc_cmd = f"lsof -i :{port} 2>/dev/null || ss -tlnp | grep :{port}"
+                    proc_out = run_command(proc_cmd, skip_translate=True)
+                    return f"⚠️ 端口 {port}/{protocol} 已被占用\n\n{proc_out}"
+            else:
+                return f"✅ 端口 {port}/{protocol} 未被占用（可使用）"
+        except Exception as e:
+            return f"错误：检查端口失败 - {e}"
+
+    elif action == "ping":
+        if not target:
+            return "错误：action=ping 需要 target 参数"
+        # 防注入：仅允许字母数字点破折号
+        if not all(c.isalnum() or c in ".-" for c in target):
+            return f"错误：target 含非法字符 '{target}'"
+        if _is_windows_local():
+            cmd = f"ping -n 4 {target}"
+        else:
+            cmd = f"ping -c 4 {target}"
+        return run_command(cmd)
+
+    elif action == "connections":
+        if _is_windows_local():
+            cmd = "netstat -ano | findstr ESTABLISHED"
+        else:
+            cmd = "ss -tn state established 2>/dev/null || netstat -tn | grep ESTABLISHED"
+        return run_command(cmd)
+
+    else:
+        return f"错误：action 必须是 list/check/ping/connections 之一"
+
+
+def local_process_check(action: str = "top", name: str = "",
+                        pid: int = 0, top_n: int = 10) -> str:
+    """本地进程查看工具（跨平台：Windows/Linux 自动适配）。
+
+    Args:
+        action: 操作类型：
+            - top: 按 CPU 占用排序显示前 N 个进程（默认）
+            - memory: 按内存占用排序显示前 N 个进程
+            - find: 按名称查找进程（需 name 参数）
+            - kill: 结束指定进程（需 pid 或 name 参数）
+        name: 进程名（action=find/kill 时使用）
+        pid: 进程 ID（action=kill 时使用，优先于 name）
+        top_n: 返回前 N 个进程（默认 10）
+
+    Returns:
+        进程信息
+    """
+    if action == "top":
+        if _is_windows_local():
+            # PowerShell 按 CPU 排序（内部用单引号避免与外层双引号冲突）
+            cmd = (
+                'powershell -NoProfile -Command "'
+                f"Get-Process | Sort-Object CPU -Descending | Select-Object -First {top_n} "
+                "Id, ProcessName, CPU, @{N='Mem(MB)';E={[int]($_.WorkingSet/1MB)}} | Format-Table -AutoSize"
+                '"'
+            )
+        else:
+            cmd = f"ps aux --sort=-%cpu | head -n {top_n + 1}"
+        return run_command(cmd, skip_translate=True)
+
+    elif action == "memory":
+        if _is_windows_local():
+            cmd = (
+                'powershell -NoProfile -Command "'
+                f"Get-Process | Sort-Object WorkingSet -Descending | Select-Object -First {top_n} "
+                "Id, ProcessName, CPU, @{N='Mem(MB)';E={[int]($_.WorkingSet/1MB)}} | Format-Table -AutoSize"
+                '"'
+            )
+        else:
+            cmd = f"ps aux --sort=-%mem | head -n {top_n + 1}"
+        return run_command(cmd, skip_translate=True)
+
+    elif action == "find":
+        if not name:
+            return "错误：action=find 需要 name 参数"
+        # 防注入：仅允许字母数字点下划线
+        if not all(c.isalnum() or c in "._-" for c in name):
+            return f"错误：name 含非法字符 '{name}'"
+        if _is_windows_local():
+            cmd = f'tasklist | findstr /I "{name}"'
+        else:
+            cmd = f"ps aux | grep -i {name} | grep -v grep"
+        return run_command(cmd)
+
+    elif action == "kill":
+        if pid:
+            if _is_windows_local():
+                cmd = f"taskkill /PID {pid} /F"
+            else:
+                cmd = f"kill -9 {pid}"
+            return run_command(cmd)
+        elif name:
+            if not all(c.isalnum() or c in "._-" for c in name):
+                return f"错误：name 含非法字符 '{name}'"
+            if _is_windows_local():
+                cmd = f'taskkill /IM "{name}" /F'
+            else:
+                cmd = f"pkill -f {name}"
+            return run_command(cmd)
+        else:
+            return "错误：action=kill 需要 pid 或 name 参数"
+
+    else:
+        return f"错误：action 必须是 top/memory/find/kill 之一"
+
+
+def local_disk_check(action: str = "list", path: str = "") -> str:
+    """本地磁盘空间分析工具（跨平台：Windows/Linux 自动适配）。
+
+    Args:
+        action: 操作类型：
+            - list: 列出所有磁盘及使用率（默认）
+            - top: 显示指定目录下 Top10 大目录/文件
+        path: action=top 时指定分析目录（Windows: 'C:' 或 'C:\\Users'；Linux: '/var'），默认根目录
+
+    Returns:
+        磁盘使用情况
+    """
+    if action == "list":
+        if _is_windows_local():
+            cmd = ('powershell -NoProfile -Command "Get-CimInstance Win32_LogicalDisk -Filter \'DriveType=3\' | '
+                   "ForEach-Object { $t=[math]::Round($_.Size/1GB,1); $f=[math]::Round($_.FreeSpace/1GB,1); "
+                   "$u=[math]::Round($t-$f,1); $p=if($t-gt 0){[math]::Round($u/$t*100,1)}else{0}; "
+                   "Write-Output ($_.DeviceID + ' 总:' + $t + 'GB 已用:' + $u + 'GB 可用:' + $f + 'GB 使用率:' + $p + '%') }\"")
+        else:
+            cmd = "df -h"
+        return run_command(cmd)
+
+    elif action == "top":
+        if _is_windows_local():
+            target = path if path else "C:\\"
+            target = target.replace("/", "\\")
+            # 扫描顶层子目录大小
+            cmd = (
+                'powershell -NoProfile -Command "'
+                f"$root = '{target}';"
+                "$dirs = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue;"
+                "foreach ($d in $dirs) { try {"
+                "  $size = (Get-ChildItem -Path $d.FullName -File -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum;"
+                "  $mb = [math]::Round($size/1MB, 1);"
+                "  if ($mb -gt 10) { Write-Output ($mb.ToString().PadLeft(10) + 'MB  ' + $d.FullName) }"
+                "} catch {} }\""
+            )
+            return run_command(cmd)
+        else:
+            target = path if path else "/"
+            cmd = f"du -h --max-depth=1 {target} 2>/dev/null | sort -rh | head -n 10"
+            return run_command(cmd)
+
+    else:
+        return f"错误：action 必须是 list/top 之一"
+
+
+def local_service_check(action: str = "list", service: str = "") -> str:
+    """本地服务管理工具（跨平台：Windows/Linux 自动适配）。
+
+    Args:
+        action: 操作类型：
+            - list: 列出所有运行中的服务（默认）
+            - status: 查看指定服务状态（需 service 参数）
+            - start: 启动服务（需管理员权限）
+            - stop: 停止服务（需管理员权限）
+            - restart: 重启服务（需管理员权限）
+        service: 服务名（action=status/start/stop/restart 时必填）
+
+    Returns:
+        服务信息
+    """
+    if action == "list":
+        if _is_windows_local():
+            cmd = 'powershell -NoProfile -Command "Get-Service | Where-Object {$_.Status -eq \'Running\'} | Select-Object Status, Name, DisplayName | Format-Table -AutoSize"'
+        else:
+            cmd = "systemctl list-units --type=service --state=running 2>/dev/null | head -n 30"
+        return run_command(cmd)
+
+    elif action in ("status", "start", "stop", "restart"):
+        if not service:
+            return f"错误：action={action} 需要 service 参数"
+        # 防注入：仅允许字母数字点下划线破折号
+        if not all(c.isalnum() or c in "._-" for c in service):
+            return f"错误：service 含非法字符 '{service}'"
+
+        if _is_windows_local():
+            if action == "status":
+                cmd = f'powershell -NoProfile -Command "Get-Service -Name {service} -ErrorAction SilentlyContinue | Select-Object Status, Name, DisplayName | Format-Table -AutoSize"'
+            elif action == "start":
+                cmd = f'powershell -NoProfile -Command "Start-Service -Name {service}"'
+            elif action == "stop":
+                cmd = f'powershell -NoProfile -Command "Stop-Service -Name {service} -Force"'
+            elif action == "restart":
+                cmd = f'powershell -NoProfile -Command "Restart-Service -Name {service} -Force"'
+        else:
+            if action == "status":
+                cmd = f"systemctl status {service}"
+            else:
+                cmd = f"sudo systemctl {action} {service}"
+        return run_command(cmd)
+
+    else:
+        return f"错误：action 必须是 list/status/start/stop/restart 之一"
 
 
 def search_files(pattern: str, path: str = ".") -> str:
@@ -2944,7 +3343,7 @@ _LATEX_FUNCTIONS = {
 
 
 def _latex_to_unicode(latex: str) -> str:
-    """将单个 LaTeX 公式转换为 Unicode 终端可显示文本
+    r"""将单个 LaTeX 公式转换为 Unicode 终端可显示文本
 
     支持：
     - 希腊字母：\\alpha → α, \\Sigma → Σ
@@ -3798,7 +4197,7 @@ def _lit_review_search_arxiv(topic: str, num: int) -> list:
 
 
 def render_formula(latex: str, style: str = "unicode") -> str:
-    """渲染 LaTeX 公式为终端可显示的 Unicode 文本
+    r"""渲染 LaTeX 公式为终端可显示的 Unicode 文本
 
     参数：
     - latex: LaTeX 公式字符串，如 "E=mc^2" 或 "\\sum_{i=1}^{n} x_i^2"
@@ -5769,9 +6168,18 @@ def _ssh_detect_os(conn_id: str = "default") -> str:
 
 
 def _ssh_audit(host: str, user: str, command: str, result_summary: str = ""):
-    """记录SSH操作审计日志"""
+    """记录SSH操作审计日志（脱敏：不显示完整 IP 地址）"""
     import datetime
-    entry = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {user}@{host} → {command[:200]}"
+    # 安全设计：对 host 进行脱敏处理，不显示完整 IP
+    # 如果是 IP 地址，只保留前两段，后两段用 *** 替代
+    # 如果是域名，保留原样
+    import re as _re_audit
+    if _re_audit.match(r'^(\d{1,3}\.){3}\d{1,3}$', host):
+        parts = host.split(".")
+        safe_host = f"{parts[0]}.{parts[1]}.***.***"
+    else:
+        safe_host = host
+    entry = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {user}@{safe_host} → {command[:200]}"
     if result_summary:
         entry += f" | {result_summary[:100]}"
     _SSH_AUDIT_LOG.append(entry)
@@ -5782,25 +6190,27 @@ def _ssh_audit(host: str, user: str, command: str, result_summary: str = ""):
 def _ssh_format_prefix(conn_id: str = "default") -> str:
     """生成运维结果的服务器标识前缀（防混淆）。
 
-    格式: "[conn_id@host]" 或 "[conn_id@host | 备注]"
+    格式: "[conn_id | 备注]" 或 "[conn_id]"
 
     多服务器场景下，每个运维工具的返回结果都应以此前缀开头，
     让用户和 AI 一眼看清这是哪台机器的输出。
+
+    安全设计：不在前缀中显示服务器 IP 地址，仅用 conn_id 和备注标识。
+    如需查看完整连接信息（含 IP），请用 ssh_list 工具。
 
     Args:
         conn_id: 连接ID
 
     Returns:
-        形如 "[nas@192.168.10.6 | NAS存储服务器]" 的前缀字符串
+        形如 "[nas | NAS存储服务器]" 或 "[default]" 的前缀字符串
     """
     info = _SSH_CONNECTIONS.get(conn_id)
     if not info:
-        return f"[{conn_id}@未知]"
-    host = info.get("host", "?")
+        return f"[{conn_id}]"
     remark = info.get("remark", "")
     if remark:
-        return f"[{conn_id}@{host} | {remark}]"
-    return f"[{conn_id}@{host}]"
+        return f"[{conn_id} | {remark}]"
+    return f"[{conn_id}]"
 
 
 def _ssh_check_dangerous(command: str) -> tuple:
@@ -5837,12 +6247,12 @@ def _ssh_validate_host(host: str) -> tuple:
                 elif parts[0] == "192" and parts[1] != "168":
                     pass  # 192.x 但不是168，不阻断
                 else:
-                    return False, f"内网地址被策略阻断: {hostname}"
+                    return False, "内网地址被策略阻断（如需连接内网，请联系管理员调整策略）"
         return True, ""
     elif re.match(domain_pattern, hostname):
         return True, ""
     else:
-        return False, f"主机地址格式无效: {host}"
+        return False, f"主机地址格式无效（请检查 IP/域名格式）"
 
 
 def ssh_connect(host: str, user: str, password: str = "", key_path: str = "",
@@ -5914,7 +6324,7 @@ def ssh_connect(host: str, user: str, password: str = "", key_path: str = "",
         except asyncssh.DisconnectError as e:
             return f"连接失败：服务器拒绝连接 (code={e.code}, reason={e.reason})"
         except asyncio.TimeoutError:
-            return f"连接失败：超时（15秒内未连接到 {host}）"
+            return f"连接失败：超时（15秒内未连接到服务器，请检查网络和端口）"
         except OSError as e:
             return f"连接失败：网络错误 ({e})"
 
@@ -5936,7 +6346,10 @@ def ssh_connect(host: str, user: str, password: str = "", key_path: str = "",
         _SSH_OS_CACHE.pop(conn_id, None)
         _ssh_audit(host, user, "[CONNECT]", f"成功 conn_id={conn_id} remark={remark}")
         remark_line = f"\n  备注: {remark}" if remark else ""
-        return (f"✅ SSH连接成功\n  主机: {host}\n  用户: {user}\n  端口: {port if ':' not in host else host.split(':')[1]}\n"
+        # 安全设计：不在返回结果中显示服务器 IP 地址，仅显示备注/conn_id
+        # IP 地址仅存储在内部 _SSH_CONNECTIONS 中供工具内部使用
+        server_label = remark if remark else conn_id
+        return (f"✅ SSH连接成功\n  服务器: {server_label}\n  用户: {user}\n  端口: {port if ':' not in host else host.split(':')[1]}\n"
                 f"  连接ID: {conn_id}\n  认证方式: {'密钥' if key_path else '密码'}{remark_line}\n"
                 f"  提示: 后续运维操作请传 conn_id='{conn_id}'")
     except Exception as e:
@@ -6295,7 +6708,7 @@ def ssh_setup_samba_share(share_name: str = "shared",
                           access_mode: str = "guest_rw",
                           samba_password: str = "",
                           conn_id: str = "default") -> str:
-    """一键配置 Samba 共享文件夹（Linux 服务器专用，自动完成全部步骤）。
+    r"""一键配置 Samba 共享文件夹（Linux 服务器专用，自动完成全部步骤）。
 
     自动执行的 8 个步骤：
     1. 检测操作系统（必须是 Linux，Windows 应该用 New-SmbShare）
@@ -6514,7 +6927,7 @@ def ssh_setup_samba_share(share_name: str = "shared",
     if "test.txt" in r_test:
         report.append(f"  ✅ 共享写入测试通过")
 
-    # 获取服务器 IP
+    # 获取服务器信息
     info = _SSH_CONNECTIONS.get(conn_id, {})
     host = info.get("host", "服务器IP")
     remark = info.get("remark", "")
@@ -6532,7 +6945,7 @@ def ssh_setup_samba_share(share_name: str = "shared",
     else:
         report.append(f"  权限: {'读写' if access_mode == 'guest_rw' else '只读'}（无需密码）")
     if remark:
-        report.append(f"\n【服务器备注】{remark}")
+        report.append(f"\n【服务器备注】{remark}（conn_id: {conn_id}）")
     report.append(f"\n【共享路径】{share_path}")
     report.append(f"【配置文件】/etc/samba/smb.conf（原配置已备份为 smb.conf.bak.*）")
 
@@ -6565,10 +6978,13 @@ def ssh_list(conn_id: str = "") -> str:
         is_closed = _ssh_is_conn_closed(info["conn"])
         os_type = _SSH_OS_CACHE.get(conn_id, "?") if not is_closed else "?"
         remark = info.get("remark", "")
+        # 安全设计：不显示服务器 IP，仅显示备注或 conn_id
+        server_label = remark if remark else conn_id
         lines = [
             f"连接ID: {conn_id}",
-            f"  主机: {info['host']}:{info.get('port', 22)}",
+            f"  服务器: {server_label}",
             f"  用户: {info['user']}",
+            f"  端口: {info.get('port', 22)}",
             f"  状态: {'❌ 已断开' if is_closed else '✅ 已连接'}",
             f"  操作系统: {os_type}",
             f"  连接时长: {_fmt_uptime(uptime)}",
@@ -6592,7 +7008,9 @@ def ssh_list(conn_id: str = "") -> str:
             status = "❌" if is_closed else "✅"
             os_type = _SSH_OS_CACHE.get(cid, "?") if not is_closed else "?"
             remark = info.get("remark", "")
-            line = (f"  {status} {cid}: {info['user']}@{info['host']}:{info.get('port', 22)} "
+            # 安全设计：不显示 IP，用备注或 conn_id 标识服务器
+            server_label = remark if remark else cid
+            line = (f"  {status} {cid}: {info['user']}@{server_label}:{info.get('port', 22)} "
                     f"({ _fmt_uptime(uptime)}) [OS: {os_type}]")
             if remark:
                 line += f" 备注: {remark}"
@@ -6636,7 +7054,10 @@ def ssh_disconnect(conn_id: str = "default") -> str:
         pass
 
     _ssh_audit(conn_info["host"], conn_info["user"], "[DISCONNECT]", f"conn_id={conn_id}")
-    return f"✅ 已断开连接 '{conn_id}' ({conn_info['user']}@{conn_info['host']})"
+    # 安全设计：不显示服务器 IP，用备注或 conn_id 标识
+    remark = conn_info.get("remark", "")
+    server_label = remark if remark else conn_id
+    return f"✅ 已断开连接 '{conn_id}' ({conn_info['user']}@{server_label})"
 
 
 # ====== AI 远程运维工具集（基于 ssh_exec 的高层封装）======
@@ -6801,29 +7222,61 @@ def ssh_log_view(service: str = "", lines: int = 100, follow: bool = False,
     os_type = _ssh_detect_os(conn_id)
 
     if os_type == "windows":
-        # Windows 事件日志查看（Get-EventLog）
-        # service 参数在 Windows 上映射为日志名（Application/System/Security）
-        log_name = "System"  # 默认系统日志
-        if service and service.lower() in ("app", "application"):
+        # Windows 事件日志查看（用 Get-WinEvent 替代已废弃的 Get-EventLog）
+        # service 参数在 Windows 上映射为日志名：
+        #   - 空/未指定 → System（系统日志）
+        #   - app/application → Application（应用程序日志）
+        #   - sec/security → Security（安全日志）
+        #   - setup → Setup（安装日志）
+        #   - forward → ForwardedEvents（转发事件）
+        #   - 其他字符串 → 视为自定义日志名（如 Microsoft-Windows-PowerShell/Operational）
+        svc_lower = (service or "").lower().strip()
+        if not svc_lower:
+            log_name = "System"
+        elif svc_lower in ("app", "application"):
             log_name = "Application"
-        elif service and service.lower() in ("sec", "security"):
+        elif svc_lower in ("sec", "security"):
             log_name = "Security"
+        elif svc_lower in ("setup",):
+            log_name = "Setup"
+        elif svc_lower in ("forward", "forwarded"):
+            log_name = "ForwardedEvents"
+        else:
+            # 视为自定义日志名（防注入：仅允许字母数字-/_）
+            if all(c.isalnum() or c in "-/_" for c in service):
+                log_name = service
+            else:
+                return f"错误：service 参数含非法字符 '{service}'（仅允许字母数字-/_）"
 
-        # 构造 PowerShell 命令
+        # 构造 Get-WinEvent 命令（比 Get-EventLog 性能更好，支持更多日志）
+        # FilterHashtable 比 Where-Object 过滤更高效
         if keyword:
-            # 带关键词过滤
-            safe_kw = keyword.replace("'", "''")
+            # 带关键词过滤：先按时间倒序取最近 N 条，再用 Message 匹配
+            # 注意：Get-WinEvent 的 Message 字段不能直接在 FilterHashtable 中过滤
+            # 所以用 Where-Object 二次过滤
+            safe_kw = keyword.replace("'", "''").replace('"', '`"')
+            # 先取较多条目用于过滤（避免过滤后条目太少）
+            fetch_n = min(lines * 5, 1000)
             cmd = (
                 'powershell -NoProfile -Command "'
-                f"Get-EventLog -LogName {log_name} -Newest {lines} -Message '*{safe_kw}*' -ErrorAction SilentlyContinue | "
-                "Select-Object TimeGenerated, EntryType, Source, EventID | Format-Table -AutoSize"
+                f"$events = Get-WinEvent -LogName '{log_name}' -MaxEvents {fetch_n} -ErrorAction SilentlyContinue | "
+                f"Where-Object {{ $_.Message -like '*{safe_kw}*' }} | Select-Object -First {lines};"
+                "$events | Sort-Object TimeCreated -Descending | ForEach-Object {"
+                "  $level = switch ($_.LevelDisplayName) { 'Error' {'❌'} 'Warning' {'⚠️'} 'Information' {'ℹ️'} default {'?'} };"
+                "  $msg = ($_.Message -replace '\\r?\\n', ' ').Substring(0, [Math]::Min(80, ($_.Message).Length));"
+                "  Write-Output ($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $level + ' [' + $_.Id + '] ' + $_.ProviderName + ': ' + $msg)"
+                "}"
                 '"'
             )
         else:
             cmd = (
                 'powershell -NoProfile -Command "'
-                f"Get-EventLog -LogName {log_name} -Newest {lines} -ErrorAction SilentlyContinue | "
-                "Select-Object TimeGenerated, EntryType, Source, EventID | Format-Table -AutoSize"
+                f"Get-WinEvent -LogName '{log_name}' -MaxEvents {lines} -ErrorAction SilentlyContinue | "
+                "Sort-Object TimeCreated -Descending | ForEach-Object {"
+                "  $level = switch ($_.LevelDisplayName) { 'Error' {'❌'} 'Warning' {'⚠️'} 'Information' {'ℹ️'} default {'?'} };"
+                "  $msg = if ($_.Message) { ($_.Message -replace '\\r?\\n', ' ').Substring(0, [Math]::Min(80, ($_.Message).Length)) } else { '' };"
+                "  Write-Output ($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $level + ' [' + $_.Id + '] ' + $_.ProviderName + ': ' + $msg)"
+                "}"
                 '"'
             )
 
@@ -6831,15 +7284,19 @@ def ssh_log_view(service: str = "", lines: int = 100, follow: bool = False,
         if raw.startswith("错误") or raw.startswith("连接失败"):
             return raw
 
-        # 自动异常统计
-        err_count = raw.lower().count("error") + raw.lower().count("错误")
-        warn_count = raw.lower().count("warning") + raw.lower().count("警告")
-        summary = f"\n\n[日志分析] 共 {len(raw.splitlines())} 行，错误 {err_count} 次，警告 {warn_count} 次"
+        # 自动异常统计（基于等级图标计数）
+        err_count = raw.count("❌")
+        warn_count = raw.count("⚠️")
+        info_count = raw.count("ℹ️")
+        total = err_count + warn_count + info_count
+        summary = f"\n\n[日志分析] {log_name} 共 {total} 条，错误 {err_count} 条，警告 {warn_count} 条，信息 {info_count} 条"
         if err_count > 10:
             summary += " ⚠️ 错误密度高，建议深入排查"
         elif err_count > 0:
             summary += " ℹ️ 存在少量错误"
-        return f"$ 查看 {log_name} 事件日志（最近 {lines} 条）\n{raw}{summary}"
+        if "无法找到" in raw or "No events were found" in raw or "not found" in raw.lower():
+            summary += "\n💡 该日志名可能不存在，可用 ssh_exec('powershell -Command \"Get-WinEvent -ListLog * | Select-Object LogName\"') 查看所有可用日志"
+        return f"{_ssh_format_prefix(conn_id)}\n$ 查看 {log_name} 事件日志（最近 {lines} 条）\n{raw}{summary}"
 
     # Linux 日志查看（原有逻辑保留）
     if service:
@@ -6934,8 +7391,15 @@ def ssh_disk_analyze(path: str = "/", conn_id: str = "default") -> str:
 
     if os_type == "windows":
         # Windows 磁盘分析
+        # 使用 Get-Volume（现代 cmdlet，Windows 8+ / Server 2012+）+ Get-CimInstance（兼容后备）
+        # path 解析：
+        #   - "/" 或空 → 所有盘符
+        #   - "C:" / "C:\" → 指定盘符
+        #   - "C:\Users" → 指定目录（先显示所在盘，再分析该目录大小）
+        import re as _re_module
+
         if path == "/" or not path:
-            # 列出所有盘符
+            # 列出所有盘符（用 Get-Volume 显示更现代的卷信息 + Get-CimInstance 补充容量）
             vol_cmd = (
                 'powershell -NoProfile -Command "'
                 "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {"
@@ -6948,11 +7412,19 @@ def ssh_disk_analyze(path: str = "/", conn_id: str = "default") -> str:
                 '"'
             )
         else:
-            # 指定盘符
+            # 指定盘符或目录
+            # 提取盘符（前两个字符，如 "C:"）
             drive = path[:2] if len(path) >= 2 else path
+            # 防注入：仅允许字母+冒号
+            if not _re_module.match(r'^[A-Za-z]:$', drive):
+                return f"错误：Windows 路径需以盘符开头（如 'C:' 或 'C:\\Users'），收到 '{path}'"
+            # 用 Where-Object 过滤替代 -Filter，避免双引号嵌套问题
+            # （cmd 中双引号无法嵌套，-Filter 参数的引号会被错误解析）
             vol_cmd = (
                 'powershell -NoProfile -Command "'
-                f"Get-CimInstance Win32_LogicalDisk -Filter \\\"DeviceID='{drive}'\\\" | ForEach-Object {{"
+                f"$target = '{drive}';"
+                "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | "
+                "Where-Object { $_.DeviceID -eq $target } | ForEach-Object {"
                 "  $totalD = [math]::Round($_.Size/1GB, 1);"
                 "  $freeD = [math]::Round($_.FreeSpace/1GB, 1);"
                 "  $usedD = [math]::Round($totalD - $freeD, 1);"
@@ -6961,13 +7433,12 @@ def ssh_disk_analyze(path: str = "/", conn_id: str = "default") -> str:
                 "}"
                 '"'
             )
-        vol_out = ssh_exec(vol_cmd, conn_id=conn_id, timeout=15)
+        vol_out = ssh_exec(vol_cmd, conn_id=conn_id, _internal=True, timeout=15)
 
-        # 分析
+        # 分析磁盘使用率
         analysis = ""
-        import re
         for line in vol_out.split("\n"):
-            m = re.search(r"使用率:([\d.]+)%", line)
+            m = _re_module.search(r"使用率:([\d.]+)%", line)
             if m:
                 pct = float(m.group(1))
                 if pct >= 90:
@@ -6977,7 +7448,42 @@ def ssh_disk_analyze(path: str = "/", conn_id: str = "default") -> str:
                 elif pct >= 70:
                     analysis += f"\nℹ️ 磁盘使用率 {pct}%（关注）"
 
-        return f"[磁盘使用]\n$ {vol_cmd}\n{vol_out}{analysis}"
+        # Top10 大目录分析（对应 Linux 的 du --max-depth=1）
+        # 优化：只扫描顶层子目录，每个子目录内部递归统计文件大小
+        # （原 -Recurse -Depth 2 方案会对每个深层目录重复扫描，O(n²) 复杂度，大目录超时）
+        target_path = path if (path and path != "/") else "C:\\"
+        # 规范化路径：把 / 转为 \
+        target_path = target_path.replace("/", "\\")
+        # 如果只给了盘符（如 "C:"），补全为 "C:\\"
+        if _re_module.match(r'^[A-Za-z]:$', target_path):
+            target_path = target_path + "\\"
+
+        # PowerShell 命令：扫描顶层子目录，每个子目录递归统计文件总大小
+        # 用 foreach 循环替代 ForEach-Object（性能更好）
+        # 用 -ErrorAction SilentlyContinue 跳过无权限目录
+        # 注意：如果路径是盘符根目录（如 C:\），扫描顶层子目录可能仍较慢
+        #       因此设置 90 秒超时，并在返回结果中提示
+        du_cmd = (
+            'powershell -NoProfile -Command "'
+            f"$root = '{target_path}';"
+            "$topDirs = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue;"
+            "foreach ($d in $topDirs) {"
+            "  try {"
+            "    $size = (Get-ChildItem -Path $d.FullName -File -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum;"
+            "    $sizeMB = [math]::Round($size/1MB, 1);"
+            "    if ($sizeMB -gt 10) { Write-Output ($sizeMB.ToString().PadLeft(10) + 'MB  ' + $d.FullName) }"
+            "  } catch {}"
+            "}"
+            '"'
+        )
+        du_out = ssh_exec(du_cmd, conn_id=conn_id, _internal=True, timeout=90)
+
+        # 如果扫描结果为空或超时，给出提示
+        if not du_out.strip() or "超时" in du_out or "timeout" in du_out.lower():
+            du_out = du_out or "(无输出)"
+            du_out += "\n💡 提示：扫描大目录可能较慢，建议指定更具体的路径（如 'C:\\Users' 而非 'C:\\'）"
+
+        return f"{_ssh_format_prefix(conn_id)}\n[磁盘使用]\n$ {vol_cmd}\n{vol_out}{analysis}\n\n[Top10 大目录]\n$ {du_cmd}\n{du_out}"
 
     # Linux 磁盘分析（原有逻辑保留）
     # df 查看整体
@@ -7066,23 +7572,30 @@ def ssh_network_diag(action: str = "stats", target: str = "",
 
 def ssh_docker_manage(action: str, container: str = "",
                       conn_id: str = "default") -> str:
-    """Docker 容器管理。
+    r"""Docker 容器管理（跨平台：Linux 原生 Docker / Windows Docker Desktop）。
 
     Args:
-        action: 操作类型：ps / psa / logs / start / stop / restart / stats / images
+        action: 操作类型：ps / psa / logs / start / stop / restart / stats / images / info
             - ps: 运行中容器
             - psa: 所有容器（含已停止）
             - logs: 查看容器日志（需 container 参数）
             - start/stop/restart: 容器生命周期（需 container 参数）
             - stats: 资源占用
             - images: 镜像列表
+            - info: Docker 系统信息（版本、存储驱动、运行环境）
         container: 容器名/ID（logs/start/stop/restart 必填）
         conn_id: SSH 连接ID
 
     Returns:
         Docker 操作结果
+
+    Windows Docker Desktop 适配说明：
+        - 命令前缀使用 docker.exe（显式调用，避免 PowerShell 别名冲突）
+        - --format 字符串用双引号包裹（PowerShell 单引号会原样输出 Go template）
+        - 自动检测 Docker Desktop 是否运行（依赖 WSL2 后端）
+        - Windows 上 docker 命令在 PATH 中：C:\Program Files\Docker\Docker\resources\bin\
     """
-    valid_actions = {"ps", "psa", "logs", "start", "stop", "restart", "stats", "images"}
+    valid_actions = {"ps", "psa", "logs", "start", "stop", "restart", "stats", "images", "info"}
     if action not in valid_actions:
         return f"错误：action 必须是 {sorted(valid_actions)} 之一"
 
@@ -7094,26 +7607,65 @@ def ssh_docker_manage(action: str, container: str = "",
     if container and not container.replace("-", "").replace("_", "").replace(".", "").replace("/", "").isalnum():
         return f"错误：容器名 '{container}' 不合法"
 
+    os_type = _ssh_detect_os(conn_id)
+    is_windows = (os_type == "windows")
+
+    # Windows 用 docker.exe，Linux 用 docker
+    docker_cmd = "docker.exe" if is_windows else "docker"
+
     if action == "ps":
-        cmd = "docker ps --format 'table {{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'"
+        if is_windows:
+            # cmd 下用双引号包裹 Go template（单引号在 cmd 中是字面字符，会被 docker 误认）
+            cmd = f'{docker_cmd} ps --format "table {{{{.ID}}}}\\t{{{{.Names}}}}\\t{{{{.Image}}}}\\t{{{{.Status}}}}\\t{{{{.Ports}}}}"'
+        else:
+            cmd = "docker ps --format 'table {{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'"
     elif action == "psa":
-        cmd = "docker ps -a --format 'table {{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Status}}'"
+        if is_windows:
+            cmd = f'{docker_cmd} ps -a --format "table {{{{.ID}}}}\\t{{{{.Names}}}}\\t{{{{.Image}}}}\\t{{{{.Status}}}}"'
+        else:
+            cmd = "docker ps -a --format 'table {{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Status}}'"
     elif action == "logs":
-        cmd = f"docker logs --tail 100 {container}"
+        cmd = f"{docker_cmd} logs --tail 100 {container}"
     elif action == "start":
-        cmd = f"docker start {container}"
+        cmd = f"{docker_cmd} start {container}"
     elif action == "stop":
-        cmd = f"docker stop {container}"
+        cmd = f"{docker_cmd} stop {container}"
     elif action == "restart":
-        cmd = f"docker restart {container}"
+        cmd = f"{docker_cmd} restart {container}"
     elif action == "stats":
-        cmd = "docker stats --no-stream --format 'table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}'"
+        if is_windows:
+            cmd = f'{docker_cmd} stats --no-stream --format "table {{{{.Name}}}}\\t{{{{.CPUPerc}}}}\\t{{{{.MemUsage}}}}"'
+        else:
+            cmd = "docker stats --no-stream --format 'table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}'"
+    elif action == "info":
+        # Docker 系统信息（跨平台兼容）
+        cmd = f"{docker_cmd} version && {docker_cmd} info --format 'Server Version: {{{{.ServerVersion}}}}\\nStorage Driver: {{{{.Driver}}}}\\nRunning Containers: {{{{.ContainersRunning}}}}\\nTotal Containers: {{{{.Containers}}}}\\nImages: {{{{.Images}}}}'"
     else:  # images
-        cmd = "docker images --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.Size}}'"
+        if is_windows:
+            cmd = f'{docker_cmd} images --format "table {{{{.Repository}}}}\\t{{{{.Tag}}}}\\t{{{{.Size}}}}"'
+        else:
+            cmd = "docker images --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.Size}}'"
+
+    # Windows 上先检测 Docker Desktop 是否安装并运行
+    if is_windows:
+        # 用 where 命令快速检测 docker.exe 是否存在
+        check_cmd = "where docker.exe 2>nul || echo NOT_FOUND"
+        check_out = ssh_exec(check_cmd, conn_id=conn_id, _internal=True, timeout=8)
+        if "NOT_FOUND" in check_out or not check_out.strip():
+            return f"{_ssh_format_prefix(conn_id)}\n❌ Windows 服务器未安装 Docker Desktop\n（安装路径通常是 C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe）"
 
     raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=60 if action == "stats" else 30)
-    if "command not found" in raw.lower() or "not recognized" in raw.lower():
-        return "❌ 服务器未安装 Docker"
+    raw_lower = raw.lower()
+    if ("command not found" in raw_lower
+            or "not recognized" in raw_lower
+            or "不是内部或外部命令" in raw_lower
+            or "无法找到" in raw_lower):
+        return f"{_ssh_format_prefix(conn_id)}\n❌ 服务器未安装 Docker"
+    # Windows Docker Desktop 未运行时的常见错误
+    if is_windows and ("error during connect" in raw_lower
+                       or "the docker daemon is not running" in raw_lower
+                       or "cannot connect to the docker daemon" in raw_lower):
+        return f"{_ssh_format_prefix(conn_id)}\n❌ Docker Desktop 未运行，请先启动 Docker Desktop\n$ {cmd}\n{raw}"
     return f"{_ssh_format_prefix(conn_id)}\n$ {cmd}\n{raw}"
 
 
@@ -7147,22 +7699,61 @@ def ssh_firewall_manage(action: str, port: int = 0, protocol: str = "tcp",
     os_type = _ssh_detect_os(conn_id)
 
     if os_type == "windows":
-        # Windows 防火墙管理（netsh advfirewall）
+        # Windows 防火墙管理（netsh advfirewall + Get-NetFirewallRule 组合）
+        # netsh 适合增删规则，Get-NetFirewallRule 适合查询统计
         if action == "status":
-            cmd = "netsh advfirewall show allprofiles state"
+            # 用 PowerShell 的 Get-NetFirewallProfile 显示各配置文件状态（更直观）
+            cmd = (
+                'powershell -NoProfile -Command "'
+                "Get-NetFirewallProfile | ForEach-Object {"
+                "  $state = if ($_.Enabled) {'✅ 已启用'} else {'❌ 已禁用'};"
+                "  Write-Output ($_.Name + ' - ' + $state + ' (入站默认: ' + $_.DefaultInboundAction + ', 出站默认: ' + $_.DefaultOutboundAction + ')')"
+                "}"
+                '"'
+            )
         elif action == "list":
-            cmd = "netsh advfirewall firewall show rule name=all"
+            # 用 Get-NetFirewallRule 列出 ZeroAI 创建的规则（避免输出过长）
+            # 默认只显示 ZeroAI-* 规则，避免列出数千条系统规则
+            # 注意：Get-NetFirewallRule 返回对象的 Action 是枚举值（1=NotConfigured, 2=Allow, 3=Block）
+            #       Direction 也是枚举值（1=Inbound, 2=Outbound）
+            cmd = (
+                'powershell -NoProfile -Command "'
+                "$rules = Get-NetFirewallRule -ErrorAction SilentlyContinue | "
+                "Where-Object { $_.DisplayName -like 'ZeroAI-*' -or $_.DisplayName -like 'ZeroAI_*' };"
+                "if ($rules) {"
+                "  $rules | ForEach-Object {"
+                "    $action = switch ($_.Action) { 2 {'✅允许'} 3 {'❌阻止'} default {'?' } };"
+                "    $dir = if ($_.Direction -eq 1) {'入站'} else {'出站'};"
+                "    $enabled = if ($_.Enabled) {'启用'} else {'禁用'};"
+                "    Write-Output ($_.DisplayName + ' [' + $dir + ' ' + $action + ' ' + $enabled + ']')"
+                "  }"
+                "} else {"
+                "  Write-Output '提示：当前无 ZeroAI 创建的防火墙规则。如需查看全部规则，请用 ssh_exec 直接执行：netsh advfirewall firewall show rule name=all'"
+                "}"
+                '"'
+            )
         elif action == "open":
+            # 开放端口：用 netsh 添加规则（兼容旧版 Windows）
+            # 规则名格式 ZeroAI-Allow-{port}-{protocol} 便于后续查询和删除
             cmd = f'netsh advfirewall firewall add rule name="ZeroAI-Allow-{port}-{protocol}" dir=in action=allow protocol={protocol} localport={port}'
         elif action == "close":
+            # 关闭端口：按规则名 + 端口双重匹配删除（更精确）
             cmd = f'netsh advfirewall firewall delete rule name="ZeroAI-Allow-{port}-{protocol}" dir=in protocol={protocol} localport={port}'
         elif action == "enable":
             cmd = "netsh advfirewall set allprofiles state on"
         else:  # disable
             cmd = "netsh advfirewall set allprofiles state off"
 
-        raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=15)
-        return f"[Windows 防火墙] $ {cmd}\n{raw}"
+        raw = ssh_exec(cmd, conn_id=conn_id, _internal=True, timeout=20 if action == "list" else 15)
+        # Windows 下额外提示
+        extra_hint = ""
+        if action == "open" and "确定" in raw and "OK" in raw:
+            extra_hint = f"\n💡 已开放 {protocol}/{port}，规则名 ZeroAI-Allow-{port}-{protocol}"
+        elif action == "close":
+            extra_hint = f"\n💡 已删除 {protocol}/{port} 的规则（如存在）"
+        elif action == "disable":
+            extra_hint = "\n⚠️ 防火墙已禁用，服务器暴露在网络中，建议仅在调试时使用"
+        return f"{_ssh_format_prefix(conn_id)}\n[Windows 防火墙] $ {cmd}\n{raw}{extra_hint}"
 
     # Linux 防火墙管理（原有逻辑保留）
     # 自动检测防火墙类型
@@ -7663,7 +8254,7 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "render_formula", "description": "渲染 LaTeX 数学公式为终端可显示的 Unicode 文本。当用户写数学公式、物理方程、化学方程式、统计公式、需要学术符号展示时调用。支持希腊字母、上下标、分数、根号、求和、积分、矩阵符号等。",
         "parameters": {"type": "object", "properties": {
-            "latex": {"type": "string", "description": "LaTeX 公式字符串，如 'E=mc^2' 或 '\\\\sum_{i=1}^{n} x_i^2' 或 '\\\\frac{\\\\partial f}{\\\\partial x}'"},
+            "latex": {"type": "string", "description": r"LaTeX 公式字符串，如 'E=mc^2' 或 '\\sum_{i=1}^{n} x_i^2' 或 '\\frac{\\partial f}{\\partial x}'"},
             "style": {"type": "string", "description": "渲染样式：unicode(默认，终端显示) / raw(原始LaTeX) / latex($$包裹)"}},
             "required": ["latex"],
             "additionalProperties": False}}},
@@ -7751,7 +8342,7 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "ssh_setup_samba_share", "description": "一键配置 Samba 共享文件夹（Linux 服务器专用，8 步骤自动完成：安装+配置+启动+防火墙+SELinux+验证）。当用户说'共享文件夹/配置Samba/让Windows能访问Linux文件/文件共享/SMB共享'时调用。Windows Server 共享请用 ssh_exec 执行 New-SmbShare。",
         "parameters": {"type": "object", "properties": {
-            "share_name": {"type": "string", "description": "共享名（Windows 访问时用，如 'shared'，访问路径 \\\\IP\\shared），默认 'shared'"},
+            "share_name": {"type": "string", "description": r"共享名（Windows 访问时用，如 'shared'，访问路径 \\IP\shared），默认 'shared'"},
             "share_path": {"type": "string", "description": "共享文件夹在 Linux 上的路径，默认 '/srv/shared'"},
             "access_mode": {"type": "string", "enum": ["guest_ro", "guest_rw", "user_rw"], "description": "权限模式：guest_ro=匿名只读 / guest_rw=匿名读写（内网推荐，默认）/ user_rw=用户认证读写（需密码，更安全）"},
             "samba_password": {"type": "string", "description": "Samba 密码（仅 user_rw 模式必填，其他模式留空）"},
@@ -7770,6 +8361,39 @@ TOOLS = [
             "conn_id": {"type": "string", "description": "要断开的连接ID，默认'default'"}},
             "required": [],
             "additionalProperties": False}}},
+    # ====== 本地运维工具集（4个，跨平台）======
+    {"type": "function", "function": {
+        "name": "local_port_check", "description": "本地端口/网络检查（跨平台）。用户说'看看打开了哪些端口/端口被占用了吗/能ping通吗/谁在占用80端口'时调用。action：list=列出所有监听端口，check=检查指定端口是否被占用，ping=ping目标主机，connections=查看活跃TCP连接。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "check", "ping", "connections"], "description": "操作类型，默认list"},
+            "port": {"type": "integer", "description": "端口号（action=check 时必填）"},
+            "protocol": {"type": "string", "enum": ["tcp", "udp"], "description": "协议，默认tcp"},
+            "target": {"type": "string", "description": "目标主机/IP（action=ping 时必填）"}},
+            "required": [],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "local_process_check", "description": "本地进程查看（跨平台）。用户说'电脑卡不卡/谁在占用CPU/查chrome进程/结束PID 1234'时调用。action：top=按CPU排序前N，memory=按内存排序前N，find=按名称查找，kill=结束进程。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["top", "memory", "find", "kill"], "description": "操作类型，默认top"},
+            "name": {"type": "string", "description": "进程名（action=find/kill 时使用）"},
+            "pid": {"type": "integer", "description": "进程ID（action=kill 时使用，优先于name）"},
+            "top_n": {"type": "integer", "description": "返回前N个进程，默认10"}},
+            "required": [],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "local_disk_check", "description": "本地磁盘空间分析（跨平台）。用户说'磁盘还剩多少/哪个目录占空间最大/C盘满了'时调用。action：list=列出所有磁盘及使用率，top=显示指定目录下Top10大目录。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "top"], "description": "操作类型，默认list"},
+            "path": {"type": "string", "description": "action=top 时指定分析目录，默认根目录（Windows: C:\\，Linux: /）"}},
+            "required": [],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "local_service_check", "description": "本地服务管理（跨平台）。用户说'查看运行的服务/MySQL状态/启动docker/重启nginx'时调用。action：list=列出所有运行中的服务，status/start/stop/restart=管理指定服务。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "status", "start", "stop", "restart"], "description": "操作类型，默认list"},
+            "service": {"type": "string", "description": "服务名（action=status/start/stop/restart 时必填）"}},
+            "required": [],
+            "additionalProperties": False}}},
     # ====== AI 远程运维工具集（8个）======
     {"type": "function", "function": {
         "name": "ssh_service_manage", "description": "服务管理（Linux 用 systemctl，Windows 用 sc/Get-Service，自动适配操作系统）。用户说'查看服务状态/重启mysql/启动docker/设置开机自启/看看服务器运行了什么'时调用。返回结果含状态解读。支持 service='all' + action='status' 列出所有运行中的服务。",
@@ -7780,9 +8404,9 @@ TOOLS = [
             "required": ["action", "service"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_log_view", "description": "查看远程日志（Linux: journalctl/syslog；Windows: Get-EventLog 事件日志，自动适配）。用户说'看nginx日志/查错误/查mysql日志/搜error关键词'时调用。返回结果含自动异常统计。",
+        "name": "ssh_log_view", "description": "查看远程日志（Linux: journalctl/syslog；Windows: Get-WinEvent 事件日志，自动适配）。用户说'看nginx日志/查错误/查mysql日志/搜error关键词'时调用。返回结果含自动异常统计。",
         "parameters": {"type": "object", "properties": {
-            "service": {"type": "string", "description": "服务名（如 nginx）——若提供则用 journalctl -u，否则查看 syslog/messages"},
+            "service": {"type": "string", "description": "服务名——Linux: journalctl -u 服务名；Windows: 映射为日志名（app→Application, sec→Security, 空→System, 或自定义如 Microsoft-Windows-PowerShell/Operational）"},
             "lines": {"type": "integer", "description": "查看最后N行，默认100，范围10-1000"},
             "follow": {"type": "boolean", "description": "是否持续跟踪日志（会阻塞15秒，建议短时使用）"},
             "keyword": {"type": "string", "description": "关键词过滤（grep -i），如 error、exception、failed"},
@@ -7798,9 +8422,9 @@ TOOLS = [
             "required": [],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_disk_analyze", "description": "磁盘空间分析（Linux: df+du Top10；Windows: Get-Volume/Get-ChildItem，自动适配）。用户说'看磁盘/磁盘满了/谁占了磁盘'时调用。",
+        "name": "ssh_disk_analyze", "description": "磁盘空间分析（Linux: df+du Top10；Windows: Get-CimInstance+Get-ChildItem Top10，自动适配）。用户说'看磁盘/磁盘满了/谁占了磁盘'时调用。",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "分析的目录，默认'/'"},
+            "path": {"type": "string", "description": "分析的目录——Linux: 默认'/'；Windows: 默认所有盘符，或指定'C:'/'C:\\Users'等"},
             "conn_id": {"type": "string", "description": "SSH连接ID，默认'default'"}},
             "required": [],
             "additionalProperties": False}}},
@@ -7813,9 +8437,9 @@ TOOLS = [
             "required": ["action"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_docker_manage", "description": "Docker 容器管理。用户说'看容器/重启容器/docker日志/容器列表'时调用。",
+        "name": "ssh_docker_manage", "description": "Docker 容器管理（跨平台：Linux 原生 Docker / Windows Docker Desktop，自动适配）。用户说'看容器/重启容器/docker日志/容器列表'时调用。",
         "parameters": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["ps", "psa", "logs", "start", "stop", "restart", "stats", "images"], "description": "操作类型：ps=运行中容器/psa=所有容器/logs=查看日志/start/stop/restart=容器生命周期/stats=资源占用/images=镜像列表"},
+            "action": {"type": "string", "enum": ["ps", "psa", "logs", "start", "stop", "restart", "stats", "images", "info"], "description": "操作类型：ps=运行中容器/psa=所有容器/logs=查看日志/start/stop/restart=容器生命周期/stats=资源占用/images=镜像列表/info=Docker系统信息"},
             "container": {"type": "string", "description": "容器名/ID（logs/start/stop/restart必填）"},
             "conn_id": {"type": "string", "description": "SSH连接ID，默认'default'"}},
             "required": ["action"],
@@ -7877,13 +8501,18 @@ TOOL_MAP = {
     "ssh_docker_manage": ssh_docker_manage,
     "ssh_firewall_manage": ssh_firewall_manage,
     "ssh_health_check": ssh_health_check,
+    # 本地运维工具集（跨平台）
+    "local_port_check": local_port_check,
+    "local_process_check": local_process_check,
+    "local_disk_check": local_disk_check,
+    "local_service_check": local_service_check,
 }
 
 # ====== 工具使用规则（独立常量，主 SYSTEM_PROMPT 和子 TOOL_CAPABILITY_PROMPT 都会引用）======
-# 把 48 个工具分 9 大类，并明确"何时调用"的判断逻辑
-TOOL_USAGE_RULES = """# 工具使用规则
+# 把 52 个工具分 10 大类，并明确"何时调用"的判断逻辑
+TOOL_USAGE_RULES = r"""# 工具使用规则
 
-你有 48 个工具可用，分 9 大类：
+你有 52 个工具可用，分 10 大类：
 
 ## 文件与目录（7 个）
 - `list_dir(path, recursive, max_depth)`：浏览目录。`recursive=true` 看子目录树
@@ -7937,13 +8566,19 @@ TOOL_USAGE_RULES = """# 工具使用规则
 
 ## AI 远程运维（8 个）— 语义化运维工具，自动适配 Linux/Windows，优先调用而非手拼命令
 - `ssh_service_manage(action, service, conn_id)`：服务管理（Linux: systemctl；Windows: sc/Get-Service）。用户说"看nginx状态/重启mysql/启动docker/开机自启/看看服务器运行了什么"时用。支持 service='all' 列出所有运行中的服务
-- `ssh_log_view(service, lines, follow, keyword, conn_id)`：查看远程日志（Linux: journalctl；Windows: Get-EventLog）。用户说"看日志/查错误/搜error关键词"时用，返回自动异常统计
+- `ssh_log_view(service, lines, follow, keyword, conn_id)`：查看远程日志（Linux: journalctl；Windows: Get-WinEvent 事件日志）。用户说"看日志/查错误/搜error关键词"时用，返回自动异常统计
 - `ssh_process_check(sort_by, top_n, conn_id)`：进程查看（Linux: ps；Windows: Get-Process）。用户说"看进程/CPU占用/内存占用/谁占资源"时用
-- `ssh_disk_analyze(path, conn_id)`：磁盘分析（Linux: df+du；Windows: Get-Volume）。用户说"看磁盘/磁盘满了/谁占磁盘"时用，自动标注危急/警告
+- `ssh_disk_analyze(path, conn_id)`：磁盘分析（Linux: df+du；Windows: Get-CimInstance+Get-ChildItem Top10）。用户说"看磁盘/磁盘满了/谁占磁盘"时用，自动标注危急/警告
 - `ssh_network_diag(action, target, conn_id)`：网络诊断（Linux: ss/netstat；Windows: Get-NetTCPConnection）。用户说"看端口/ping/监听端口/网络连接"时用
-- `ssh_docker_manage(action, container, conn_id)`：Docker 管理（跨平台一致）。用户说"看容器/重启容器/docker日志"时用
+- `ssh_docker_manage(action, container, conn_id)`：Docker 管理（Linux: 原生 Docker；Windows: Docker Desktop，自动适配）。用户说"看容器/重启容器/docker日志"时用
 - `ssh_firewall_manage(action, port, protocol, conn_id)`：防火墙统一管理（Linux: ufw/firewalld/iptables；Windows: netsh advfirewall）。用户说"开端口/关端口/看防火墙"时用
 - `ssh_health_check(conn_id)`：一键健康体检（自动检测操作系统，支持 Linux 和 Windows Server）。用户说"体检/检查服务器/有问题吗/看看服务器运行了什么"时用，返回综合报告+AI分析
+
+## 本地运维（4 个）— 语义化本地运维工具，自动适配 Windows/Linux，优先调用而非手拼 run_command
+- `local_port_check(action, port, protocol, target)`：本地端口/网络检查（跨平台）。用户说"看看打开了哪些端口/端口被占用了吗/能ping通吗/谁在占用80端口"时用。action：list=列出所有监听端口，check=检查指定端口是否被占用，ping=ping目标主机，connections=查看活跃TCP连接
+- `local_process_check(action, name, pid, top_n)`：本地进程查看（跨平台）。用户说"电脑卡不卡/谁在占用CPU/查chrome进程/结束PID 1234"时用。action：top=按CPU排序前N，memory=按内存排序前N，find=按名称查找，kill=结束进程
+- `local_disk_check(action, path)`：本地磁盘空间分析（跨平台）。用户说"磁盘还剩多少/哪个目录占空间最大/C盘满了"时用。action：list=列出所有磁盘及使用率，top=显示指定目录下Top10大目录
+- `local_service_check(action, service)`：本地服务管理（跨平台）。用户说"查看运行的服务/MySQL状态/启动docker/重启nginx"时用。action：list=列出所有运行中的服务，status/start/stop/restart=管理指定服务
 
 ## 学术研究（5 个）
 - `academic_search(query, num_results, year_from, year_to, sort_by)`：学术文献搜索（Semantic Scholar 2亿+论文，含引用数/影响力/DOI）。查论文/文献/引用时用
@@ -7983,7 +8618,7 @@ TOOL_USAGE_RULES = """# 工具使用规则
 **AI 远程运维工具调用规则（重要！优先于 ssh_exec）**：
 当用户提出运维需求时，**必须优先调用语义化的运维工具**，而不是手拼 `ssh_exec` 命令。
 26. 用户说"看XX服务状态/重启XX/启动XX/开机自启/看看服务器运行了什么/服务器跑了什么服务" → `ssh_service_manage`（不要用 ssh_exec 跑 systemctl/sc/Get-Service。工具会自动检测操作系统并适配）
-27. 用户说"看XX日志/查错误/搜error/搜fail关键词" → `ssh_log_view`（不要用 ssh_exec 跑 journalctl/Get-EventLog。工具会自动适配）
+27. 用户说"看XX日志/查错误/搜error/搜fail关键词" → `ssh_log_view`（不要用 ssh_exec 跑 journalctl/Get-WinEvent。工具会自动适配）
 28. 用户说"看进程/CPU占用/内存占用/谁占资源" → `ssh_process_check`（不要用 ssh_exec 跑 ps/top/Get-Process。工具会自动适配）
 29. 用户说"看磁盘/磁盘满了/谁占磁盘/空间不足" → `ssh_disk_analyze`（不要用 ssh_exec 跑 df/du/Get-Volume。工具会自动适配）
 30. 用户说"看端口/ping/监听端口/网络连接" → `ssh_network_diag`（不要用 ssh_exec 跑 ss/netstat/Get-NetTCPConnection。工具会自动适配）
@@ -7993,22 +8628,30 @@ TOOL_USAGE_RULES = """# 工具使用规则
 34. **运维决策链**：用户说"服务器卡了" → 先 `ssh_health_check` 综合体检 → 根据 AI 分析 → 再针对性调用 `ssh_process_check`/`ssh_log_view`/`ssh_disk_analyze` 深入
 35. **运维排错链**：用户说"XX服务挂了" → 先 `ssh_service_manage(action=status, service=XX)` 看状态 → 若失败 → `ssh_log_view(service=XX, keyword=error)` 查错误日志 → 定位问题
 
-**本地电脑运维工具调用规则（重要！用户说本地电脑状态时必须主动调用 `run_command`）**：
-当用户用自然语言描述**本地电脑**（不是远程服务器）的状态、诊断、查询需求时，**必须主动调用 `run_command` 生成并执行对应命令**，而不是只用文字回答。用户想要的是"AI 帮我形成命令并自行运行"，不是"AI 教我怎么敲命令"。
-36. 用户说"看看打开了哪些端口/有什么端口在监听/哪些端口被占用" → `run_command("netstat -ano | findstr LISTENING")`（查看所有监听端口及对应 PID）
-37. 用户说"看进程/CPU占用/内存占用/谁在占用资源" → `run_command("tasklist /FO TABLE | sort")` 或 `run_command("wmic process get name,processid,workingsetsize")`
-38. 用户说"IP是多少/看网络配置/我的IP" → `run_command("ipconfig /all")`
-39. 用户说"能不能ping通XX/测网络" → `run_command("ping -n 4 目标地址")`
-40. 用户说"看磁盘/磁盘空间/还有多少空间" → `run_command("wmic logicaldisk get caption,freespace,size")` 或 `run_command("fsutil volume diskfree C:")`
-41. 用户说"看系统信息/系统版本/电脑配置" → `run_command("systeminfo | findstr /B /C:\"OS\" /C:\"系统\" /C:\"Total\"")`
-42. 用户说"看防火墙状态/开了哪些端口" → `run_command("netsh advfirewall firewall show rule name=all")` 或 `run_command("netsh advfirewall show currentprofile")`
-43. 用户说"看服务/XX服务状态/服务列表" → `run_command("sc query state= all")` 或 `run_command("sc query 具体服务名")`
-44. 用户说"环境变量/PATH/看变量" → `run_command("set")` 或 `run_command("echo %PATH%")`
-45. 用户说"看用户/当前登录用户/用户列表" → `run_command("whoami")` 或 `run_command("net user")`
-46. 用户说"路由表/看路由" → `run_command("route print")` 或 `run_command("arp -a")`
-47. **本地运维决策链**：用户说"电脑卡了" → 先 `run_command("tasklist /FO TABLE | sort /R /+65")` 看高内存进程 → 再 `run_command("wmic cpu get loadpercentage")` 看 CPU 负载 → 综合分析
-48. **本地端口排错链**：用户说"XX端口连不上" → 先 `run_command("netstat -ano | findstr :XX")` 看端口状态 → 若未监听 → `run_command("sc query XX服务")` 查服务 → 定位问题
-49. **本地命令通用规则**：用户提出任何"看看/查看/检查/诊断本地电脑 XX"的需求，且没有更专用的工具（如 `check_port` 需要具体端口号、`process_list` 已封装、`system_info` 已封装）时，**必须主动调用 `run_command` 生成对应命令并执行**，而不是只回答文字说明
+**本地电脑运维工具调用规则（重要！优先调用语义化本地运维工具，其次用 run_command）**：
+当用户用自然语言描述**本地电脑**（不是远程服务器）的状态、诊断、查询需求时，**必须主动调用工具执行**，而不是只用文字回答。用户想要的是"AI 帮我形成命令并自行运行"，不是"AI 教我怎么敲命令"。
+**优先级**：本地运维语义化工具（`local_port_check`/`local_process_check`/`local_disk_check`/`local_service_check`）> `check_port`/`process_list`/`system_info` 等已封装工具 > `run_command` 手拼命令。
+36. 用户说"看看打开了哪些端口/有什么端口在监听/哪些端口被占用" → `local_port_check(action="list")`（跨平台自动适配，优先于 run_command）
+37. 用户说"XX端口被占了吗/XX端口可用吗" → `local_port_check(action="check", port=XX)`（先尝试连接，已占用再查进程）
+38. 用户说"能不能ping通XX/测网络" → `local_port_check(action="ping", target="XX")`（Windows/Linux 自动适配 ping 参数）
+39. 用户说"看活跃连接/当前TCP连接" → `local_port_check(action="connections")`
+40. 用户说"看进程/CPU占用/内存占用/谁在占用资源" → `local_process_check(action="top")` 或 `local_process_check(action="memory")`（跨平台自动适配）
+41. 用户说"查chrome进程/找XX进程" → `local_process_check(action="find", name="chrome")`（防注入白名单过滤）
+42. 用户说"结束PID 1234/杀进程/关掉XX" → `local_process_check(action="kill", pid=1234)` 或 `local_process_check(action="kill", name="XX")`
+43. 用户说"看磁盘/磁盘空间/还有多少空间" → `local_disk_check(action="list")`（跨平台自动适配）
+44. 用户说"哪个目录占空间最大/C盘满了/谁占磁盘" → `local_disk_check(action="top", path="C:\\")`（Top10 大目录）
+45. 用户说"查看运行的服务/服务列表/服务器跑了什么" → `local_service_check(action="list")`（跨平台自动适配）
+46. 用户说"XX服务状态/MySQL起没起/docker状态" → `local_service_check(action="status", service="XX")`
+47. 用户说"启动XX/停止XX/重启XX服务" → `local_service_check(action="start/stop/restart", service="XX")`（需管理员权限）
+48. 用户说"IP是多少/看网络配置/我的IP" → `run_command("ipconfig /all")`（无专用工具，用 run_command）
+49. 用户说"看系统信息/系统版本/电脑配置" → `system_info()`（已封装工具）或 `run_command("systeminfo")`
+50. 用户说"看防火墙状态/开了哪些端口" → `run_command("netsh advfirewall firewall show rule name=all")`（本地无防火墙专用工具，用 run_command）
+51. 用户说"环境变量/PATH/看变量" → `run_command("set")` 或 `run_command("echo %PATH%")`
+52. 用户说"看用户/当前登录用户/用户列表" → `run_command("whoami")` 或 `run_command("net user")`
+53. 用户说"路由表/看路由" → `run_command("route print")` 或 `run_command("arp -a")`
+54. **本地运维决策链**：用户说"电脑卡了" → 先 `local_process_check(action="top")` 看高 CPU 进程 → 再 `local_process_check(action="memory")` 看内存 → 综合 `local_disk_check(action="list")` 看磁盘 → 综合分析
+55. **本地端口排错链**：用户说"XX端口连不上" → 先 `local_port_check(action="check", port=XX)` 看端口 → 若未监听 → `local_service_check(action="status", service="XX服务")` 查服务 → 定位问题
+56. **本地命令通用规则**：用户提出任何"看看/查看/检查/诊断本地电脑 XX"的需求，且没有更专用的语义化工具时，**必须主动调用 `run_command` 生成对应命令并执行**，而不是只回答文字说明。`run_command` 支持跨平台命令翻译：在 Windows 上输入 Linux 命令（如 `ls`/`ps`/`cat`/`grep`）会自动翻译为 Windows 等效命令（`dir`/`tasklist`/`type`/`findstr`），方便用户用习惯的命令操作
 
 ## SSH 远程部署安全规范（重要！必须严格遵守）
 当用户使用 SSH 工具进行远程部署时，必须遵循：
@@ -8039,15 +8682,17 @@ TOOL_USAGE_RULES = """# 工具使用规则
 
 2. **操作前先 ssh_list 确认**：多服务器场景下，执行任何运维操作前，**先调用 `ssh_list` 查看当前所有连接**，确认目标服务器的 conn_id
 
-3. **每次操作明确目标**：在回复用户时，必须明确说出"我正在操作 **服务器X（conn_id @ IP，备注）**"
-   - 示例："我正在操作 **nas（192.168.10.6，NAS存储服务器）**，查看运行的服务..."
+3. **每次操作明确目标**：在回复用户时，必须明确说出"我正在操作 **服务器X（conn_id，备注）**"
+   - 示例："我正在操作 **nas（NAS存储服务器）**，查看运行的服务..."
+   - 安全规则：**禁止在回复用户时显示服务器 IP 地址**，仅用 conn_id 和备注标识服务器
 
-4. **运维结果自带前缀**：所有运维工具返回结果会自动带 `[conn_id@host | 备注]` 前缀，便于识别
+4. **运维结果自带前缀**：所有运维工具返回结果会自动带 `[conn_id | 备注]` 前缀，便于识别（前缀不含 IP 地址，保护服务器地址安全）
 
 5. **用户未指定服务器时必须询问**：当用户说"重启 nginx"但未指定哪台服务器，且有多台连接时，**必须先问**"请在哪台服务器操作？"并列出可用连接
 
-6. **危险操作二次确认**：stop/restart/disable 等危险操作，必须在回复中显示目标服务器完整信息让用户确认
-   - 示例："⚠️ 即将在 **web1（192.168.10.7，Web前端服务器）** 上执行 restart nginx，确认吗？"
+6. **危险操作二次确认**：stop/restart/disable 等危险操作，必须在回复中显示目标服务器信息让用户确认
+   - 示例："⚠️ 即将在 **web1（Web前端服务器）** 上执行 restart nginx，确认吗？"
+   - 安全规则：确认信息中**不显示 IP 地址**，仅用 conn_id 和备注标识
 
 ### 4. 部署流程（ssh_deploy）
 deploy_config 必须包含以下字段：
@@ -8108,7 +8753,7 @@ deploy_config 必须包含以下字段：
 # 避免子 AI 误以为"无法访问文件系统"而拒绝响应。
 TOOL_CAPABILITY_PROMPT = """# ZeroAI 子模块能力声明（重要 - 必读）
 
-你是 ZeroAI 的子模块（专家/汇总/分析），与主系统**完全共享** 48 个工具能力。
+你是 ZeroAI 的子模块（专家/汇总/分析），与主系统**完全共享** 52 个工具能力。
 
 # 全权限模式（已启用）
 用户已授权 ZeroAI 对电脑的完全操作权限，你作为子模块也**继承全部权限**：
@@ -8184,6 +8829,12 @@ SYSTEM_PROMPT = f"""# 角色
 - **审计日志**：所有 SSH 操作自动记录（最多 200 条），可通过 ssh_list 查看
 - **安全设计**：主机地址校验、危险命令黑名单、内网IP可选阻断、输出截断保护
 
+### 连接成功后的回复规则（重要）
+- `ssh_connect` 成功后，工具已返回连接成功信息（服务器标识、conn_id、认证方式）
+- **严禁主动列出 1-9 的运维菜单**（如"1 查看日志 2 查看端口 ..."），这种菜单容易产生重复项且体验差
+- 正确做法：简洁确认"已连接成功，conn_id=xxx"，然后**等待用户明确说下一步需求**，再调用对应运维工具
+- 如果用户问"能做什么"，可简短用文字说明可用的运维工具类别，但不要输出编号列表
+
 ## ⚠️ 核心原则：命令必须直接执行，禁止输出命令文本给用户（最高优先级！）
 **这是 ZeroAI 与传统 AI 助手的根本区别**：你能想出来的所有命令，**必须直接调用 ssh_exec 工具执行**，绝对不能把命令文本输出给用户让用户手动执行。
 
@@ -8200,8 +8851,8 @@ AI：好的，请执行以下命令：
 ```
 用户：帮我创建一个共享文件夹
 AI：（直接调用 ssh_setup_samba_share 工具，一次完成所有步骤）
-    → 工具返回：✅ Samba 共享配置完成，访问路径 \\192.168.71.132\shared
-AI：已完成！Windows 资源管理器输入 \\192.168.71.132\shared 即可访问
+    → 工具返回：✅ Samba 共享配置完成，访问路径 \\\\192.168.71.132\\shared
+AI：已完成！Windows 资源管理器输入 \\\\192.168.71.132\\shared 即可访问
 ```
 
 ### 命令执行的 3 个层次（按优先级）
@@ -8232,12 +8883,12 @@ AI：已完成！Windows 资源管理器输入 \\192.168.71.132\shared 即可访
 ## AI 远程运维能力（8 个语义化工具，自动适配 Linux/Windows，优先调用而非手拼命令）
 **重要**：所有 SSH 运维工具都会通过 `_ssh_detect_os` 自动检测远程操作系统（Linux/Windows），并切换到对应命令。AI 无需关心远程是 Linux 还是 Windows，直接调用语义化工具即可。
 - **服务管理**：ssh_service_manage（Linux: systemctl；Windows: sc/Get-Service。支持 status/start/stop/restart/enable）
-- **日志分析**：ssh_log_view（Linux: journalctl；Windows: Get-EventLog 事件日志，自动统计错误密度）
+- **日志分析**：ssh_log_view（Linux: journalctl；Windows: Get-WinEvent 事件日志，自动统计错误/警告/信息密度）
 - **进程查看**：ssh_process_check（Linux: ps；Windows: Get-Process，按 CPU/内存排序 Top N）
-- **磁盘分析**：ssh_disk_analyze（Linux: df+du Top10；Windows: Get-Volume，自动标注危急/警告）
+- **磁盘分析**：ssh_disk_analyze（Linux: df+du Top10；Windows: Get-CimInstance+Get-ChildItem Top10，自动标注危急/警告）
 - **网络诊断**：ssh_network_diag（Linux: ss/netstat；Windows: Get-NetTCPConnection，端口/连接/ping/统计）
-- **Docker 管理**：ssh_docker_manage（容器/镜像/日志/资源，跨平台一致）
-- **防火墙管理**：ssh_firewall_manage（Linux: 自动识别 ufw/firewalld/iptables；Windows: netsh advfirewall）
+- **Docker 管理**：ssh_docker_manage（Linux: 原生 Docker；Windows: Docker Desktop，自动适配 docker.exe，含安装检测）
+- **防火墙管理**：ssh_firewall_manage（Linux: 自动识别 ufw/firewalld/iptables；Windows: netsh advfirewall + Get-NetFirewallRule）
 - **一键体检**：ssh_health_check（自动检测操作系统，综合报告 + AI 健康分析 + 异常项标注，支持 Linux 和 Windows Server）
 
 ## 运维决策链（AI 自主诊断流程）
@@ -8514,7 +9165,7 @@ def _sanitize_identity_leak(text: str) -> tuple:
 
 
 def render_markdown(text: str):
-    """渲染 Markdown，代码块用语法高亮，自动渲染 LaTeX 公式
+    r"""渲染 Markdown，代码块用语法高亮，自动渲染 LaTeX 公式
 
     学术研究支持：
     - 行内公式 $E=mc^2$ → E=mc²（Unicode 渲染）
