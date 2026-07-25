@@ -1657,8 +1657,54 @@ _CROSS_PLATFORM_COMMAND_MAP = {
 }
 
 
+def _translate_single_command(cmd: str) -> tuple:
+    """翻译单个命令（不含管道符）。返回 (translated, is_translated)。"""
+    if not cmd or not cmd.strip():
+        return cmd, False
+
+    cmd = cmd.strip()
+    parts = cmd.split(None, 1)
+    if not parts:
+        return cmd, False
+
+    base_cmd = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    cmd_lower = cmd.lower()
+
+    # 优先检查：原命令是否已经是 Windows 格式（以某个 value 开头）
+    # 避免 "netstat -ano" 被重复翻译为 "netstat -ano -ano"
+    for win_cmd in _CROSS_PLATFORM_COMMAND_MAP.values():
+        win_lower = win_cmd.lower()
+        if cmd_lower == win_lower or cmd_lower.startswith(win_lower + " "):
+            return cmd, False  # 已经是 Windows 命令，不翻译
+
+    # 完整短语匹配优先（按 key 长度降序，确保 "rm -rf" 在 "rm" 之前匹配）
+    for linux_cmd in sorted(_CROSS_PLATFORM_COMMAND_MAP.keys(), key=len, reverse=True):
+        win_cmd = _CROSS_PLATFORM_COMMAND_MAP[linux_cmd]
+        if cmd_lower == linux_cmd:
+            return win_cmd, True
+        if cmd_lower.startswith(linux_cmd + " "):
+            # 去掉整个匹配短语作为 rest，保留剩余参数
+            suffix = cmd[len(linux_cmd):].strip()
+            translated = f"{win_cmd} {suffix}" if suffix else win_cmd
+            return translated, True
+
+    # 单词匹配（兜底）
+    if base_cmd in _CROSS_PLATFORM_COMMAND_MAP:
+        win_cmd = _CROSS_PLATFORM_COMMAND_MAP[base_cmd]
+        if rest:
+            return f"{win_cmd} {rest}", True
+        return win_cmd, True
+
+    return cmd, False
+
+
 def _translate_command(command: str) -> tuple:
     """跨平台命令翻译：把 Linux 命令转换为 Windows 等效命令（或反之）。
+
+    支持管道符组合命令翻译：对每个管道子命令单独翻译，再重新拼接。
+    例如 'ls | grep x' → 'dir | findstr x'，'cat file | grep error' → 'type file | findstr error'。
+    注意：保留 '||'（逻辑或）不分割，只按单个 '|' 分割。
 
     Returns:
         (translated_command, is_translated)
@@ -1668,42 +1714,37 @@ def _translate_command(command: str) -> tuple:
     if not command or not command.strip():
         return command, False
 
-    cmd = command.strip()
-    # 取第一个词（命令本身，不含参数）
-    parts = cmd.split(None, 1)
-    if not parts:
+    if not _is_windows_local():
         return command, False
 
-    base_cmd = parts[0].lower()
-    rest = parts[1] if len(parts) > 1 else ""
+    cmd = command.strip()
 
-    # 在 Windows 上：Linux → Windows
-    if _is_windows_local():
-        cmd_lower = cmd.lower()
-        # 优先检查：原命令是否已经是 Windows 格式（以某个 value 开头）
-        # 避免 "netstat -ano | findstr ..." 被重复翻译为 "netstat -ano -ano | findstr ..."
-        for win_cmd in _CROSS_PLATFORM_COMMAND_MAP.values():
-            win_lower = win_cmd.lower()
-            if cmd_lower == win_lower or cmd_lower.startswith(win_lower + " "):
-                return command, False  # 已经是 Windows 命令，不翻译
-        # 完整短语匹配优先（按 key 长度降序，确保 "rm -rf" 在 "rm" 之前匹配）
-        for linux_cmd in sorted(_CROSS_PLATFORM_COMMAND_MAP.keys(), key=len, reverse=True):
-            win_cmd = _CROSS_PLATFORM_COMMAND_MAP[linux_cmd]
-            if cmd_lower == linux_cmd:
-                return win_cmd, True
-            if cmd_lower.startswith(linux_cmd + " "):
-                # 去掉整个匹配短语作为 rest，保留剩余参数
-                suffix = cmd[len(linux_cmd):].strip()
-                translated = f"{win_cmd} {suffix}" if suffix else win_cmd
-                return translated, True
-        # 单词匹配（兜底）
-        if base_cmd in _CROSS_PLATFORM_COMMAND_MAP:
-            win_cmd = _CROSS_PLATFORM_COMMAND_MAP[base_cmd]
-            if rest:
-                return f"{win_cmd} {rest}", True
-            return win_cmd, True
+    # 按单个 | 分割（保留 || 不分割）
+    # 正则：匹配单个 |，但其前后不是 |（负向后行/先行断言）
+    import re
+    # 先把 || 替换为占位符，避免被分割
+    placeholder = "\x00OR\x00"
+    cmd_protected = cmd.replace("||", placeholder)
+    # 按单个 | 分割
+    pipe_parts = cmd_protected.split("|")
 
-    return command, False
+    # 对每个子命令单独翻译
+    translated_parts = []
+    any_translated = False
+    for part in pipe_parts:
+        # 恢复 || 占位符
+        part_restored = part.replace(placeholder, "||")
+        sub_translated, sub_is = _translate_single_command(part_restored)
+        if sub_is:
+            any_translated = True
+        translated_parts.append(sub_translated)
+
+    if not any_translated:
+        return command, False
+
+    # 用 | 重新拼接（保留原 || 逻辑或）
+    result = " | ".join(translated_parts)
+    return result, True
 
 
 def run_command(command: str, skip_translate: bool = False) -> str:
@@ -2002,6 +2043,343 @@ def local_service_check(action: str = "list", service: str = "") -> str:
 
     else:
         return f"错误：action 必须是 list/status/start/stop/restart 之一"
+
+
+def local_firewall_check(action: str = "list", port: int = 0,
+                         protocol: str = "tcp", direction: str = "in",
+                         rule_name: str = "") -> str:
+    r"""本地防火墙检查/管理工具（跨平台：Windows/Linux 自动适配）。
+
+    Args:
+        action: 操作类型：
+            - list: 列出所有防火墙规则（默认）
+            - status: 查看防火墙整体状态
+            - check: 检查指定端口是否放行（需 port 参数）
+            - open: 放行指定端口（需 port 参数，可能需管理员权限）
+            - close: 关闭指定端口（需 port 参数，可能需管理员权限）
+        port: 端口号（action=check/open/close 时必填）
+        protocol: 协议（tcp/udp），默认 tcp
+        direction: 方向（in/out），默认 in（入站）
+        rule_name: 规则名（action=open/close 时可选，默认自动生成）
+
+    Returns:
+        防火墙信息
+    """
+    # 防注入：rule_name 仅允许字母数字空格下划线破折号
+    if rule_name and not all(c.isalnum() or c in " _-" for c in rule_name):
+        return f"错误：rule_name 含非法字符 '{rule_name}'"
+
+    if action == "list":
+        if _is_windows_local():
+            cmd = 'powershell -NoProfile -Command "Get-NetFirewallRule | Where-Object {$_.Enabled -eq \'True\'} | Select-Object DisplayName, Direction, Action, Profile -First 30 | Format-Table -AutoSize"'
+        else:
+            # Linux: 优先 ufw，其次 firewalld，最后 iptables
+            cmd = "ufw status 2>/dev/null || firewall-cmd --list-all 2>/dev/null || iptables -L -n 2>/dev/null | head -n 30"
+        return run_command(cmd, skip_translate=True)
+
+    elif action == "status":
+        if _is_windows_local():
+            cmd = 'powershell -NoProfile -Command "Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction | Format-Table -AutoSize"'
+        else:
+            cmd = "ufw status verbose 2>/dev/null || systemctl is-active firewalld 2>/dev/null || iptables -L -n 2>/dev/null | head -n 10"
+        return run_command(cmd, skip_translate=True)
+
+    elif action == "check":
+        if not port:
+            return "错误：action=check 需要 port 参数"
+        if _is_windows_local():
+            # 查找放行该端口的规则
+            cmd = f'powershell -NoProfile -Command "Get-NetFirewallRule -Enabled True | Where-Object {{($_.Direction -eq \'{direction.capitalize()}\') -and ($_.Action -eq \'Allow\')}} | Get-NetFirewallPortFilter | Where-Object {{($_.LocalPort -eq \'{port}\') -and ($_.Protocol -eq \'{protocol.upper()}\')}} | Format-List"'
+            return run_command(cmd, skip_translate=True)
+        else:
+            cmd = f"ufw status | grep ':?{port} ' 2>/dev/null || iptables -L -n | grep ':{port} ' 2>/dev/null"
+            result = run_command(cmd, skip_translate=True)
+            if "无输出" in result or not result.strip():
+                return f"⚠️ 端口 {port}/{protocol} 未在防火墙规则中找到放行记录（可能被阻止）"
+            return f"✅ 端口 {port}/{protocol} 已放行\n\n{result}"
+
+    elif action in ("open", "close"):
+        if not port:
+            return "错误：action=open/close 需要 port 参数"
+        if not rule_name:
+            rule_name = f"ZeroAI_{protocol}_{port}_{direction}"
+        if _is_windows_local():
+            action_ps = "Allow" if action == "open" else "Block"
+            cmd = (
+                f'powershell -NoProfile -Command "'
+                f"New-NetFirewallRule -DisplayName '{rule_name}' "
+                f"-Direction {direction.capitalize()} -Action {action_ps} "
+                f"-Protocol {protocol.upper()} -LocalPort {port}"
+                f'"'
+            )
+        else:
+            if action == "open":
+                cmd = f"ufw allow {port}/{protocol} 2>/dev/null || firewall-cmd --add-port={port}/{protocol} --permanent 2>/dev/null && firewall-cmd --reload 2>/dev/null || iptables -I INPUT -p {protocol} --dport {port} -j ACCEPT"
+            else:
+                cmd = f"ufw deny {port}/{protocol} 2>/dev/null || firewall-cmd --remove-port={port}/{protocol} --permanent 2>/dev/null && firewall-cmd --reload 2>/dev/null || iptables -D INPUT -p {protocol} --dport {port} -j ACCEPT"
+        return run_command(cmd, skip_translate=True)
+
+    else:
+        return f"错误：action 必须是 list/status/check/open/close 之一"
+
+
+def local_user_check(action: str = "list", username: str = "",
+                     detail: bool = False) -> str:
+    r"""本地用户/登录管理工具（跨平台：Windows/Linux 自动适配）。
+
+    Args:
+        action: 操作类型：
+            - list: 列出所有本地用户（默认）
+            - current: 查看当前登录用户
+            - info: 查看指定用户详情（需 username 参数）
+            - groups: 查看指定用户所属组（需 username 参数）
+            - sessions: 查看当前登录会话
+        username: 用户名（action=info/groups 时必填）
+        detail: 是否显示详细信息（action=list 时有效）
+
+    Returns:
+        用户信息
+    """
+    # 防注入：username 仅允许字母数字点下划线破折号
+    if username and not all(c.isalnum() or c in "._-" for c in username):
+        return f"错误：username 含非法字符 '{username}'"
+
+    if action == "list":
+        if _is_windows_local():
+            if detail:
+                cmd = 'powershell -NoProfile -Command "Get-LocalUser | Select-Object Name, Enabled, LastLogon, Description | Format-Table -AutoSize"'
+            else:
+                cmd = 'powershell -NoProfile -Command "Get-LocalUser | Select-Object Name, Enabled | Format-Table -AutoSize"'
+        else:
+            cmd = "cat /etc/passwd | cut -d: -f1,3,7 | head -n 50"
+        return run_command(cmd, skip_translate=True)
+
+    elif action == "current":
+        if _is_windows_local():
+            cmd = 'powershell -NoProfile -Command "whoami; Get-LocalUser | Where-Object {$_.Name -eq $env:USERNAME} | Select-Object Name, Enabled, LastLogon"'
+        else:
+            cmd = "whoami && id"
+        return run_command(cmd, skip_translate=True)
+
+    elif action == "info":
+        if not username:
+            return "错误：action=info 需要 username 参数"
+        if _is_windows_local():
+            cmd = f'powershell -NoProfile -Command "Get-LocalUser -Name {username} | Select-Object Name, Enabled, FullName, Description, LastLogon, PasswordLastSet | Format-List"'
+        else:
+            cmd = f"id {username} 2>/dev/null && grep '^{username}:' /etc/passwd"
+        return run_command(cmd, skip_translate=True)
+
+    elif action == "groups":
+        if not username:
+            return "错误：action=groups 需要 username 参数"
+        if _is_windows_local():
+            cmd = f'powershell -NoProfile -Command "Get-LocalGroup | Where-Object {{(Get-LocalGroupMember -Group $_.Name -ErrorAction SilentlyContinue).Name -contains \'{username}\'}} | Select-Object Name, Description | Format-Table -AutoSize"'
+        else:
+            cmd = f"groups {username} 2>/dev/null"
+        return run_command(cmd, skip_translate=True)
+
+    elif action == "sessions":
+        if _is_windows_local():
+            cmd = 'powershell -NoProfile -Command "query user 2>$null; Get-CimInstance Win32_LogonSession | Select-Object LogonId, LogonType, StartTime -First 10 | Format-Table -AutoSize"'
+        else:
+            cmd = "who -a 2>/dev/null | head -n 20"
+        return run_command(cmd, skip_translate=True)
+
+    else:
+        return f"错误：action 必须是 list/current/info/groups/sessions 之一"
+
+
+def local_monitor(threshold_cpu: int = 80, threshold_disk: int = 90,
+                  threshold_memory: int = 85, check_ports: str = "") -> str:
+    r"""本地综合监控告警：一次性检查 CPU/内存/磁盘/端口/防火墙，返回结构化告警报告。
+
+    跨平台自动适配 Windows/Linux。基于本地运维工具组合调用，输出标准化告警。
+
+    Args:
+        threshold_cpu: CPU 使用率告警阈值（默认 80%）
+        threshold_disk: 磁盘使用率告警阈值（默认 90%）
+        threshold_memory: 内存使用率告警阈值（默认 85%）
+        check_ports: 需要检查的关键端口（逗号分隔，如 "22,80,443,3306,8080"）
+                     为空则只列出当前监听端口，不针对性检查
+
+    Returns:
+        结构化告警报告：
+        [监控概览] 总体健康状态
+        [告警项] ⚠️ 警告 / 🚨 危急
+        [正常项] ✅ 正常
+        [建议] 💡 优化建议
+    """
+    import time as _time
+
+    report_lines = ["=" * 60]
+    report_lines.append(f"📊 本地监控告警报告  {_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    report_lines.append("=" * 60)
+
+    warnings = []   # ⚠️ 警告
+    criticals = []  # 🚨 危急
+    normals = []    # ✅ 正常
+    suggestions = []  # 💡 建议
+
+    # ===== 1. CPU 检查 =====
+    try:
+        if _is_windows_local():
+            cmd = 'powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).LoadPercentage"'
+        else:
+            cmd = "top -bn1 | grep 'Cpu(s)' | awk '{print $2}'"
+        cpu_out = run_command(cmd, skip_translate=True)
+        # 解析 CPU 使用率
+        cpu_pct = -1
+        for line in cpu_out.split("\n"):
+            line = line.strip()
+            if line and any(c.isdigit() for c in line):
+                # 提取第一个数字
+                import re
+                m = re.search(r"(\d+)", line)
+                if m:
+                    cpu_pct = int(m.group(1))
+                    break
+        if cpu_pct >= 0:
+            if cpu_pct >= threshold_cpu + 10:
+                criticals.append(f"CPU 使用率 {cpu_pct}%（危急，阈值 {threshold_cpu}%）")
+                suggestions.append("CPU 占用过高，建议用 local_process_check(action='top') 查看高 CPU 进程")
+            elif cpu_pct >= threshold_cpu:
+                warnings.append(f"CPU 使用率 {cpu_pct}%（警告，阈值 {threshold_cpu}%）")
+            else:
+                normals.append(f"CPU 使用率 {cpu_pct}%（正常）")
+        else:
+            warnings.append("CPU 使用率获取失败")
+    except Exception as e:
+        warnings.append(f"CPU 检查异常: {e}")
+
+    # ===== 2. 内存检查 =====
+    try:
+        if _is_windows_local():
+            cmd = 'powershell -NoProfile -Command "$os = Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize * 100, 1)"'
+        else:
+            cmd = "free | grep Mem | awk '{printf \"%.1f\", $3/$2*100}'"
+        mem_out = run_command(cmd, skip_translate=True).strip()
+        import re
+        m = re.search(r"(\d+(?:\.\d+)?)", mem_out)
+        if m:
+            mem_pct = float(m.group(1))
+            if mem_pct >= threshold_memory + 10:
+                criticals.append(f"内存使用率 {mem_pct}%（危急，阈值 {threshold_memory}%）")
+                suggestions.append("内存占用过高，建议用 local_process_check(action='memory') 查看高内存进程")
+            elif mem_pct >= threshold_memory:
+                warnings.append(f"内存使用率 {mem_pct}%（警告，阈值 {threshold_memory}%）")
+            else:
+                normals.append(f"内存使用率 {mem_pct}%（正常）")
+        else:
+            warnings.append("内存使用率获取失败")
+    except Exception as e:
+        warnings.append(f"内存检查异常: {e}")
+
+    # ===== 3. 磁盘检查 =====
+    try:
+        disk_out = local_disk_check(action="list")
+        import re
+        # 匹配使用率百分比
+        pcts = re.findall(r"(\d+)%", disk_out)
+        disk_high = False
+        for pct_str in pcts:
+            pct = int(pct_str)
+            if pct >= threshold_disk + 5:
+                criticals.append(f"磁盘使用率 {pct}%（危急，阈值 {threshold_disk}%）")
+                disk_high = True
+            elif pct >= threshold_disk:
+                warnings.append(f"磁盘使用率 {pct}%（警告，阈值 {threshold_disk}%）")
+                disk_high = True
+        if not disk_high:
+            normals.append(f"所有磁盘使用率低于 {threshold_disk}%（正常）")
+        if disk_high:
+            suggestions.append("磁盘空间不足，建议用 local_disk_check(action='top') 分析大目录")
+    except Exception as e:
+        warnings.append(f"磁盘检查异常: {e}")
+
+    # ===== 4. 关键端口检查 =====
+    if check_ports:
+        for port_str in check_ports.split(","):
+            port_str = port_str.strip()
+            if not port_str.isdigit():
+                continue
+            port = int(port_str)
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                result = s.connect_ex(("127.0.0.1", port))
+                s.close()
+                if result == 0:
+                    normals.append(f"端口 {port} 已监听（正常）")
+                else:
+                    # 判断是否为常见关键端口
+                    critical_ports = {22: "SSH", 80: "HTTP", 443: "HTTPS", 3306: "MySQL", 5432: "PostgreSQL", 6379: "Redis"}
+                    service_name = critical_ports.get(port, "")
+                    if service_name:
+                        criticals.append(f"关键端口 {port} ({service_name}) 未监听（危急）")
+                        suggestions.append(f"端口 {port} ({service_name}) 未监听，建议用 local_service_check(action='status', service='{service_name.lower()}') 检查服务状态")
+                    else:
+                        warnings.append(f"端口 {port} 未监听")
+            except Exception as e:
+                warnings.append(f"端口 {port} 检查异常: {e}")
+
+    # ===== 5. 防火墙状态检查 =====
+    try:
+        fw_out = local_firewall_check(action="status")
+        fw_lower = fw_out.lower()
+        if _is_windows_local():
+            if "true" in fw_lower and "enabled" in fw_lower:
+                normals.append("防火墙已启用（正常）")
+            else:
+                criticals.append("防火墙未启用（危急，建议立即启用）")
+                suggestions.append("防火墙关闭会暴露所有端口，建议立即用 local_firewall_check(action='status') 检查并启用")
+        else:
+            if "active" in fw_lower or "active: active" in fw_lower:
+                normals.append("防火墙已启用（正常）")
+            else:
+                warnings.append("防火墙可能未启用")
+    except Exception as e:
+        warnings.append(f"防火墙检查异常: {e}")
+
+    # ===== 汇总报告 =====
+    total_issues = len(warnings) + len(criticals)
+    if not criticals and not warnings:
+        status_emoji = "✅"
+        status_text = "健康"
+    elif criticals:
+        status_emoji = "🚨"
+        status_text = f"危急（{len(criticals)} 项危急，{len(warnings)} 项警告）"
+    else:
+        status_emoji = "⚠️"
+        status_text = f"警告（{len(warnings)} 项警告）"
+
+    report_lines.append(f"\n[{status_emoji} 监控概览] 总体状态：{status_text}")
+    report_lines.append(f"  检查项：CPU/内存/磁盘/端口/防火墙")
+    report_lines.append(f"  阈值：CPU≥{threshold_cpu}%  内存≥{threshold_memory}%  磁盘≥{threshold_disk}%")
+
+    if criticals:
+        report_lines.append(f"\n[🚨 危急项]")
+        for item in criticals:
+            report_lines.append(f"  🚨 {item}")
+
+    if warnings:
+        report_lines.append(f"\n[⚠️ 警告项]")
+        for item in warnings:
+            report_lines.append(f"  ⚠️ {item}")
+
+    if normals:
+        report_lines.append(f"\n[✅ 正常项]")
+        for item in normals:
+            report_lines.append(f"  ✅ {item}")
+
+    if suggestions:
+        report_lines.append(f"\n[💡 优化建议]")
+        for item in suggestions:
+            report_lines.append(f"  💡 {item}")
+
+    report_lines.append("\n" + "=" * 60)
+    return "\n".join(report_lines)
 
 
 def search_files(pattern: str, path: str = ".") -> str:
@@ -8394,6 +8772,33 @@ TOOLS = [
             "service": {"type": "string", "description": "服务名（action=status/start/stop/restart 时必填）"}},
             "required": [],
             "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "local_firewall_check", "description": "本地防火墙检查/管理（跨平台）。用户说'看防火墙/防火墙状态/80端口放行了吗/开放8080端口/关闭80端口'时调用。action：list=列出所有规则，status=防火墙整体状态，check=检查端口是否放行，open/close=放行/关闭端口。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "status", "check", "open", "close"], "description": "操作类型，默认list"},
+            "port": {"type": "integer", "description": "端口号（action=check/open/close 时必填）"},
+            "protocol": {"type": "string", "enum": ["tcp", "udp"], "description": "协议，默认tcp"},
+            "direction": {"type": "string", "enum": ["in", "out"], "description": "方向（in入站/out出站），默认in"},
+            "rule_name": {"type": "string", "description": "规则名（action=open/close 时可选，默认自动生成）"}},
+            "required": [],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "local_user_check", "description": "本地用户/登录管理（跨平台）。用户说'查看用户/当前登录用户/用户列表/admin用户信息/用户所属组/登录会话'时调用。action：list=列出所有用户，current=当前登录用户，info=用户详情，groups=用户所属组，sessions=登录会话。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "current", "info", "groups", "sessions"], "description": "操作类型，默认list"},
+            "username": {"type": "string", "description": "用户名（action=info/groups 时必填）"},
+            "detail": {"type": "boolean", "description": "是否显示详细信息（action=list 时有效）"}},
+            "required": [],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "local_monitor", "description": "本地综合监控告警（跨平台）。用户说'体检/监控/检查电脑健康/系统监控/告警检查/有什么异常'时调用。一次性检查 CPU/内存/磁盘/端口/防火墙，返回结构化告警报告（危急/警告/正常/建议）。配合 schedule 工具可实现定时监控。",
+        "parameters": {"type": "object", "properties": {
+            "threshold_cpu": {"type": "integer", "description": "CPU 使用率告警阈值（默认 80）"},
+            "threshold_disk": {"type": "integer", "description": "磁盘使用率告警阈值（默认 90）"},
+            "threshold_memory": {"type": "integer", "description": "内存使用率告警阈值（默认 85）"},
+            "check_ports": {"type": "string", "description": "需检查的关键端口（逗号分隔，如 '22,80,443,3306'），为空则不针对性检查"}},
+            "required": [],
+            "additionalProperties": False}}},
     # ====== AI 远程运维工具集（8个）======
     {"type": "function", "function": {
         "name": "ssh_service_manage", "description": "服务管理（Linux 用 systemctl，Windows 用 sc/Get-Service，自动适配操作系统）。用户说'查看服务状态/重启mysql/启动docker/设置开机自启/看看服务器运行了什么'时调用。返回结果含状态解读。支持 service='all' + action='status' 列出所有运行中的服务。",
@@ -8506,13 +8911,16 @@ TOOL_MAP = {
     "local_process_check": local_process_check,
     "local_disk_check": local_disk_check,
     "local_service_check": local_service_check,
+    "local_firewall_check": local_firewall_check,
+    "local_user_check": local_user_check,
+    "local_monitor": local_monitor,
 }
 
 # ====== 工具使用规则（独立常量，主 SYSTEM_PROMPT 和子 TOOL_CAPABILITY_PROMPT 都会引用）======
-# 把 52 个工具分 10 大类，并明确"何时调用"的判断逻辑
+# 把 55 个工具分 10 大类，并明确"何时调用"的判断逻辑
 TOOL_USAGE_RULES = r"""# 工具使用规则
 
-你有 52 个工具可用，分 10 大类：
+你有 55 个工具可用，分 10 大类：
 
 ## 文件与目录（7 个）
 - `list_dir(path, recursive, max_depth)`：浏览目录。`recursive=true` 看子目录树
@@ -8574,11 +8982,14 @@ TOOL_USAGE_RULES = r"""# 工具使用规则
 - `ssh_firewall_manage(action, port, protocol, conn_id)`：防火墙统一管理（Linux: ufw/firewalld/iptables；Windows: netsh advfirewall）。用户说"开端口/关端口/看防火墙"时用
 - `ssh_health_check(conn_id)`：一键健康体检（自动检测操作系统，支持 Linux 和 Windows Server）。用户说"体检/检查服务器/有问题吗/看看服务器运行了什么"时用，返回综合报告+AI分析
 
-## 本地运维（4 个）— 语义化本地运维工具，自动适配 Windows/Linux，优先调用而非手拼 run_command
+## 本地运维（7 个）— 语义化本地运维工具，自动适配 Windows/Linux，优先调用而非手拼 run_command
 - `local_port_check(action, port, protocol, target)`：本地端口/网络检查（跨平台）。用户说"看看打开了哪些端口/端口被占用了吗/能ping通吗/谁在占用80端口"时用。action：list=列出所有监听端口，check=检查指定端口是否被占用，ping=ping目标主机，connections=查看活跃TCP连接
 - `local_process_check(action, name, pid, top_n)`：本地进程查看（跨平台）。用户说"电脑卡不卡/谁在占用CPU/查chrome进程/结束PID 1234"时用。action：top=按CPU排序前N，memory=按内存排序前N，find=按名称查找，kill=结束进程
 - `local_disk_check(action, path)`：本地磁盘空间分析（跨平台）。用户说"磁盘还剩多少/哪个目录占空间最大/C盘满了"时用。action：list=列出所有磁盘及使用率，top=显示指定目录下Top10大目录
 - `local_service_check(action, service)`：本地服务管理（跨平台）。用户说"查看运行的服务/MySQL状态/启动docker/重启nginx"时用。action：list=列出所有运行中的服务，status/start/stop/restart=管理指定服务
+- `local_firewall_check(action, port, protocol, direction, rule_name)`：本地防火墙检查/管理（跨平台）。用户说"看防火墙/防火墙状态/80端口放行了吗/开放8080端口/关闭80端口"时用。action：list=列出所有规则，status=防火墙整体状态，check=检查端口是否放行，open/close=放行/关闭端口
+- `local_user_check(action, username, detail)`：本地用户/登录管理（跨平台）。用户说"查看用户/当前登录用户/用户列表/admin用户信息/用户所属组/登录会话"时用。action：list=列出所有用户，current=当前登录用户，info=用户详情，groups=用户所属组，sessions=登录会话
+- `local_monitor(threshold_cpu, threshold_disk, threshold_memory, check_ports)`：本地综合监控告警（跨平台）。用户说"体检/监控/系统健康检查/告警/有什么异常"时用。一次性检查 CPU/内存/磁盘/端口/防火墙，返回结构化告警报告（危急/警告/正常/建议）
 
 ## 学术研究（5 个）
 - `academic_search(query, num_results, year_from, year_to, sort_by)`：学术文献搜索（Semantic Scholar 2亿+论文，含引用数/影响力/DOI）。查论文/文献/引用时用
@@ -8645,13 +9056,44 @@ TOOL_USAGE_RULES = r"""# 工具使用规则
 47. 用户说"启动XX/停止XX/重启XX服务" → `local_service_check(action="start/stop/restart", service="XX")`（需管理员权限）
 48. 用户说"IP是多少/看网络配置/我的IP" → `run_command("ipconfig /all")`（无专用工具，用 run_command）
 49. 用户说"看系统信息/系统版本/电脑配置" → `system_info()`（已封装工具）或 `run_command("systeminfo")`
-50. 用户说"看防火墙状态/开了哪些端口" → `run_command("netsh advfirewall firewall show rule name=all")`（本地无防火墙专用工具，用 run_command）
-51. 用户说"环境变量/PATH/看变量" → `run_command("set")` 或 `run_command("echo %PATH%")`
-52. 用户说"看用户/当前登录用户/用户列表" → `run_command("whoami")` 或 `run_command("net user")`
-53. 用户说"路由表/看路由" → `run_command("route print")` 或 `run_command("arp -a")`
-54. **本地运维决策链**：用户说"电脑卡了" → 先 `local_process_check(action="top")` 看高 CPU 进程 → 再 `local_process_check(action="memory")` 看内存 → 综合 `local_disk_check(action="list")` 看磁盘 → 综合分析
-55. **本地端口排错链**：用户说"XX端口连不上" → 先 `local_port_check(action="check", port=XX)` 看端口 → 若未监听 → `local_service_check(action="status", service="XX服务")` 查服务 → 定位问题
-56. **本地命令通用规则**：用户提出任何"看看/查看/检查/诊断本地电脑 XX"的需求，且没有更专用的语义化工具时，**必须主动调用 `run_command` 生成对应命令并执行**，而不是只回答文字说明。`run_command` 支持跨平台命令翻译：在 Windows 上输入 Linux 命令（如 `ls`/`ps`/`cat`/`grep`）会自动翻译为 Windows 等效命令（`dir`/`tasklist`/`type`/`findstr`），方便用户用习惯的命令操作
+50. 用户说"看防火墙/防火墙状态/防火墙规则" → `local_firewall_check(action="status")` 或 `local_firewall_check(action="list")`（跨平台自动适配，优先于 run_command）
+51. 用户说"XX端口放行了吗/XX端口防火墙开了吗" → `local_firewall_check(action="check", port=XX)`
+52. 用户说"开放XX端口/放行XX端口/关闭XX端口" → `local_firewall_check(action="open/close", port=XX)`
+53. 用户说"看用户/用户列表/本地用户" → `local_user_check(action="list")`（跨平台自动适配，优先于 run_command）
+54. 用户说"当前登录用户/我是谁" → `local_user_check(action="current")`
+55. 用户说"XX用户信息/XX用户详情" → `local_user_check(action="info", username="XX")`
+56. 用户说"XX用户所属组/XX在哪些组" → `local_user_check(action="groups", username="XX")`
+57. 用户说"登录会话/谁在登录/会话列表" → `local_user_check(action="sessions")`
+58. 用户说"体检/系统监控/健康检查/有什么异常/告警检查" → `local_monitor()`（一次性检查 CPU/内存/磁盘/端口/防火墙，返回结构化告警报告）
+59. 用户说"监控关键端口/检查 22 80 443 端口" → `local_monitor(check_ports="22,80,443")`
+60. 用户说"定时监控/每 10 分钟检查一次" → 用 `schedule` 工具创建定时任务，message 设为"调用 local_monitor 检查系统健康并报告异常"
+61. 用户说"环境变量/PATH/看变量" → `run_command("set")` 或 `run_command("echo %PATH%")`
+62. 用户说"路由表/看路由" → `run_command("route print")` 或 `run_command("arp -a")`
+63. **本地运维决策链**：用户说"电脑卡了" → 先 `local_process_check(action="top")` 看高 CPU 进程 → 再 `local_process_check(action="memory")` 看内存 → 综合 `local_disk_check(action="list")` 看磁盘 → 综合分析
+64. **本地端口排错链**：用户说"XX端口连不上" → 先 `local_port_check(action="check", port=XX)` 看端口 → 若未监听 → `local_service_check(action="status", service="XX服务")` 查服务 → 若服务正常 → `local_firewall_check(action="check", port=XX)` 查防火墙 → 定位问题
+65. **本地安全审计链**：用户说"检查电脑安全" → 先 `local_firewall_check(action="status")` 看防火墙 → 再 `local_user_check(action="list")` 看用户 → 再 `local_port_check(action="list")` 看开放端口 → 综合分析
+66. **本地命令通用规则**：用户提出任何"看看/查看/检查/诊断本地电脑 XX"的需求，且没有更专用的语义化工具时，**必须主动调用 `run_command` 生成对应命令并执行**，而不是只回答文字说明。`run_command` 支持跨平台命令翻译：在 Windows 上输入 Linux 命令（如 `ls`/`ps`/`cat`/`grep`）会自动翻译为 Windows 等效命令（`dir`/`tasklist`/`type`/`findstr`），**支持管道符组合命令翻译**（如 `ls | grep x` → `dir | findstr x`，`cat file | grep error` → `type file | findstr error`），方便用户用习惯的 Linux 命令操作
+
+**本地运维结果 AI 分析规则（重要！调用运维工具后必须主动分析）**：
+调用本地运维工具（`local_*` 系列）获取结果后，**必须主动分析结果并标注异常**，不要只把原始输出丢给用户。分析维度：
+67. **端口分析**：`local_port_check` 返回后 → 标注高危端口（如 22/3389/445 暴露公网）、异常监听进程、未知端口
+68. **进程分析**：`local_process_check` 返回后 → 标注 CPU/内存占用异常（>80%）、可疑进程（挖矿/未知）、僵尸进程
+69. **磁盘分析**：`local_disk_check` 返回后 → 标注使用率危急（>90% 警告 / >95% 危急）、增长异常的目录
+70. **服务分析**：`local_service_check` 返回后 → 标注应有但未运行的服务、异常停止的服务、占用资源异常的服务
+71. **防火墙分析**：`local_firewall_check` 返回后 → 标注防火墙关闭风险、过高危端口放行、规则冲突
+72. **用户分析**：`local_user_check` 返回后 → 标注异常新增用户、禁用账户被启用、隐藏账户、异常登录会话
+73. **监控告警分析**：`local_monitor` 返回后 → 报告已自带结构化告警，AI 只需对危急项给出具体处理建议
+74. **分析输出格式**：
+```
+[运维结果]
+<原始输出摘要>
+
+[AI 分析]
+✅ 正常项：<列出正常指标>
+⚠️ 警告项：<列出异常指标，含具体数值和建议>
+🚨 危急项：<列出严重问题，含紧急处理建议>
+💡 建议：<针对性优化建议>
+```
 
 ## SSH 远程部署安全规范（重要！必须严格遵守）
 当用户使用 SSH 工具进行远程部署时，必须遵循：
@@ -8753,7 +9195,7 @@ deploy_config 必须包含以下字段：
 # 避免子 AI 误以为"无法访问文件系统"而拒绝响应。
 TOOL_CAPABILITY_PROMPT = """# ZeroAI 子模块能力声明（重要 - 必读）
 
-你是 ZeroAI 的子模块（专家/汇总/分析），与主系统**完全共享** 52 个工具能力。
+你是 ZeroAI 的子模块（专家/汇总/分析），与主系统**完全共享** 55 个工具能力。
 
 # 全权限模式（已启用）
 用户已授权 ZeroAI 对电脑的完全操作权限，你作为子模块也**继承全部权限**：
