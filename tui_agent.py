@@ -5598,6 +5598,63 @@ def _ssh_is_conn_closed(conn) -> bool:
         return True
 
 
+# 操作系统检测缓存（按 conn_id 缓存，避免每次都探测）
+_SSH_OS_CACHE = {}
+
+
+def _ssh_detect_os(conn_id: str = "default") -> str:
+    """检测远程服务器操作系统。返回 'windows' / 'linux'。
+    结果按 conn_id 缓存，连接断开后自动清除缓存。
+
+    探测策略（多重冗余，避免单一命令失败导致误判）：
+    1. 优先用 `ver` 命令（Windows cmd 内建，输出含 "Microsoft Windows"）
+    2. 回退用 `echo %OS%`（Windows 输出 "Windows_NT"）
+    3. 再回退用 `uname`（Linux 输出内核名，Windows 无此命令）
+    """
+    # 如果连接已不存在，清除缓存
+    if conn_id not in _SSH_CONNECTIONS:
+        _SSH_OS_CACHE.pop(conn_id, None)
+        return "linux"  # 默认按 Linux 处理
+
+    # 命中缓存
+    if conn_id in _SSH_OS_CACHE:
+        return _SSH_OS_CACHE[conn_id]
+
+    os_type = "linux"  # 默认 Linux
+
+    # 探测1：ver 命令（Windows cmd 内建，最可靠）
+    try:
+        raw1 = ssh_exec("ver", conn_id=conn_id, timeout=8)
+        if raw1 and ("Microsoft" in raw1 or "Windows" in raw1):
+            os_type = "windows"
+    except Exception:
+        pass
+
+    # 探测2：echo %OS%（Windows 输出 Windows_NT）
+    if os_type == "linux":
+        try:
+            raw2 = ssh_exec("echo %OS%", conn_id=conn_id, timeout=8)
+            if raw2 and "Windows_NT" in raw2:
+                os_type = "windows"
+        except Exception:
+            pass
+
+    # 探测3：uname（Linux 一定有输出，Windows 会报错）
+    if os_type == "linux":
+        try:
+            raw3 = ssh_exec("uname", conn_id=conn_id, timeout=8)
+            # Linux 的 uname 会输出 Linux/Darwin 等；Windows 会报 "不是内部或外部命令"
+            if raw3 and ("不是内部或外部命令" in raw3 or "not recognized" in raw3
+                         or "无法找到" in raw3):
+                # uname 不存在 → 大概率是 Windows
+                os_type = "windows"
+        except Exception:
+            pass
+
+    _SSH_OS_CACHE[conn_id] = os_type
+    return os_type
+
+
 def _ssh_audit(host: str, user: str, command: str, result_summary: str = ""):
     """记录SSH操作审计日志"""
     import datetime
@@ -6142,11 +6199,12 @@ def ssh_disconnect(conn_id: str = "default") -> str:
 
 
 def ssh_service_manage(action: str, service: str, conn_id: str = "default") -> str:
-    """systemd 服务管理（统一封装 systemctl）。
+    """服务管理（Linux 用 systemctl，Windows 用 sc/Get-Service）。
 
     Args:
         action: 操作类型，可选值：status / start / stop / restart / reload / enable / disable / is-active / is-enabled
-        service: 服务名（如 nginx、mysql、docker、ssh）
+            特殊：service="all" + action="status" 可列出所有运行中的服务
+        service: 服务名（如 nginx、mysql、docker、ssh、spooler），或 "all" 查看全部
         conn_id: SSH 连接ID
 
     Returns:
@@ -6158,8 +6216,99 @@ def ssh_service_manage(action: str, service: str, conn_id: str = "default") -> s
     if action not in valid_actions:
         return f"错误：action 必须是 {sorted(valid_actions)} 之一"
 
-    if not service or not service.replace("-", "").replace("_", "").replace(".", "").isalnum():
+    # service 校验：允许 "all" 或合法服务名
+    if not service:
+        return f"错误：必须提供 service 参数（服务名或 'all'）"
+    if service != "all" and not service.replace("-", "").replace("_", "").replace(".", "").isalnum():
         return f"错误：服务名 '{service}' 不合法（仅允许字母数字-_.）"
+
+    os_type = _ssh_detect_os(conn_id)
+
+    if os_type == "windows":
+        # Windows 服务管理（用 sc 命令，兼容性最好）
+        if service == "all":
+            if action == "status":
+                # 列出所有运行中的服务（State=Running）
+                cmd = 'powershell -NoProfile -Command "Get-Service | Where-Object {$_.Status -eq \'Running\'} | Format-Table Name, DisplayName, Status -AutoSize"'
+                raw = ssh_exec(cmd, conn_id=conn_id, timeout=30)
+                return f"$ 列出所有运行中的服务\n{raw}\n\n提示：共显示运行中的服务，可用 ssh_service_manage(action='status', service='具体服务名') 查看单个服务详情"
+            else:
+                return f"错误：service='all' 只支持 action='status'"
+        else:
+            # 单个服务操作
+            action_map = {
+                "status": ("sc", "query"),
+                "start": ("sc", "start"),
+                "stop": ("sc", "stop"),
+                "restart": ("sc", "stop & sc start"),  # Windows sc 无 restart，用 stop+start
+                "is-active": ("sc", "query"),
+            }
+            if action in ("enable", "disable", "is-enabled", "reload"):
+                # 这些是 systemd 概念，Windows 用 sc config
+                if action == "enable":
+                    cmd = f'sc config {service} start= auto'
+                elif action == "disable":
+                    cmd = f'sc config {service} start= demand'
+                elif action == "is-enabled":
+                    cmd = f'sc qc {service}'
+                else:  # reload
+                    return "错误：Windows 服务不支持 reload，请用 restart"
+                raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+                interp = ""
+                if action == "enable":
+                    interp = " → ✅ 已设置开机自启（自动启动）"
+                elif action == "disable":
+                    interp = " → ✅ 已改为手动启动"
+                elif action == "is-enabled":
+                    if "AUTO_START" in raw:
+                        interp = " → 已设置开机自启"
+                    elif "DEMAND_START" in raw:
+                        interp = " → 手动启动"
+                    elif "DISABLED" in raw:
+                        interp = " → 已禁用"
+                return f"$ {cmd}\n{raw}{interp}"
+
+            sc_cmd, sc_action = action_map.get(action, ("sc", "query"))
+            if action == "restart":
+                cmd = f'{sc_cmd} {sc_action} {service}'
+            else:
+                cmd = f'{sc_cmd} {sc_action} {service}'
+            raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+
+            # Windows 状态解读
+            interp = ""
+            if action in ("status", "is-active"):
+                if "RUNNING" in raw:
+                    interp = " → ✅ 服务运行中"
+                elif "STOPPED" in raw:
+                    interp = " ⚠️ 服务已停止"
+                elif "START_PENDING" in raw:
+                    interp = " → 服务正在启动"
+                elif "STOP_PENDING" in raw:
+                    interp = " → 服务正在停止"
+                elif "The specified service does not exist" in raw or "1060" in raw:
+                    interp = " ❌ 服务不存在（检查服务名拼写或未安装）"
+            elif action == "start":
+                if "SUCCESS" in raw:
+                    interp = " → ✅ 服务已启动"
+                elif "1056" in raw or "already running" in raw.lower():
+                    interp = " → 服务已在运行"
+            elif action == "stop":
+                if "SUCCESS" in raw:
+                    interp = " → ✅ 服务已停止"
+                elif "1062" in raw or "not started" in raw.lower():
+                    interp = " → 服务未在运行"
+
+            return f"$ {cmd}\n{raw}{interp}"
+
+    # Linux 服务管理（systemd，原有逻辑保留）
+    if service == "all":
+        if action == "status":
+            cmd = "systemctl list-units --type=service --state=running --no-pager"
+            raw = ssh_exec(cmd, conn_id=conn_id, timeout=20)
+            return f"$ {cmd}\n{raw}"
+        else:
+            return f"错误：service='all' 只支持 action='status'"
 
     cmd = f"systemctl {action} {service}"
     raw = ssh_exec(cmd, conn_id=conn_id, timeout=30)
@@ -6190,10 +6339,10 @@ def ssh_service_manage(action: str, service: str, conn_id: str = "default") -> s
 
 def ssh_log_view(service: str = "", lines: int = 100, follow: bool = False,
                  keyword: str = "", conn_id: str = "default") -> str:
-    """查看远程日志（systemd journalctl / 通用日志文件）。
+    """查看远程日志（Linux: journalctl/syslog；Windows: Get-EventLog 事件日志）。
 
     Args:
-        service: 服务名（如 nginx）——若提供则用 journalctl -u，否则查看 /var/log/syslog 或 messages
+        service: 服务名（如 nginx）——Linux 用 journalctl -u；Windows 忽略，查看系统事件日志
         lines: 查看最后 N 行，默认 100
         follow: 是否持续跟踪（注意：会阻塞直到超时，建议短时使用）
         keyword: 关键词过滤（grep），如 error / exception / fail
@@ -6203,6 +6352,51 @@ def ssh_log_view(service: str = "", lines: int = 100, follow: bool = False,
         日志内容 + 自动异常统计
     """
     lines = max(10, min(int(lines), 1000))  # 限制 10-1000
+
+    os_type = _ssh_detect_os(conn_id)
+
+    if os_type == "windows":
+        # Windows 事件日志查看（Get-EventLog）
+        # service 参数在 Windows 上映射为日志名（Application/System/Security）
+        log_name = "System"  # 默认系统日志
+        if service and service.lower() in ("app", "application"):
+            log_name = "Application"
+        elif service and service.lower() in ("sec", "security"):
+            log_name = "Security"
+
+        # 构造 PowerShell 命令
+        if keyword:
+            # 带关键词过滤
+            safe_kw = keyword.replace("'", "''")
+            cmd = (
+                'powershell -NoProfile -Command "'
+                f"Get-EventLog -LogName {log_name} -Newest {lines} -Message '*{safe_kw}*' -ErrorAction SilentlyContinue | "
+                "Select-Object TimeGenerated, EntryType, Source, EventID | Format-Table -AutoSize"
+                '"'
+            )
+        else:
+            cmd = (
+                'powershell -NoProfile -Command "'
+                f"Get-EventLog -LogName {log_name} -Newest {lines} -ErrorAction SilentlyContinue | "
+                "Select-Object TimeGenerated, EntryType, Source, EventID | Format-Table -AutoSize"
+                '"'
+            )
+
+        raw = ssh_exec(cmd, conn_id=conn_id, timeout=30)
+        if raw.startswith("错误") or raw.startswith("连接失败"):
+            return raw
+
+        # 自动异常统计
+        err_count = raw.lower().count("error") + raw.lower().count("错误")
+        warn_count = raw.lower().count("warning") + raw.lower().count("警告")
+        summary = f"\n\n[日志分析] 共 {len(raw.splitlines())} 行，错误 {err_count} 次，警告 {warn_count} 次"
+        if err_count > 10:
+            summary += " ⚠️ 错误密度高，建议深入排查"
+        elif err_count > 0:
+            summary += " ℹ️ 存在少量错误"
+        return f"$ 查看 {log_name} 事件日志（最近 {lines} 条）\n{raw}{summary}"
+
+    # Linux 日志查看（原有逻辑保留）
     if service:
         cmd = f"journalctl -u {service} -n {lines} --no-pager"
     else:
@@ -6246,7 +6440,30 @@ def ssh_process_check(sort_by: str = "cpu", top_n: int = 15,
         return "错误：sort_by 必须是 cpu 或 mem"
     top_n = max(5, min(int(top_n), 50))
 
-    # ps 命令按 CPU/内存排序
+    os_type = _ssh_detect_os(conn_id)
+
+    if os_type == "windows":
+        # Windows 进程查看（用 PowerShell 的 Get-Process）
+        sort_prop = "CPU" if sort_by == "cpu" else "WorkingSet64"
+        cmd = (
+            'powershell -NoProfile -Command "'
+            f"Get-Process | Sort-Object {sort_prop} -Descending | Select-Object -First {top_n} | "
+            "ForEach-Object {"
+            "  $cpu = if ($_.CPU) { [math]::Round($_.CPU, 1) } else { 0 };"
+            "  $memMB = [math]::Round($_.WorkingSet64/1MB, 0);"
+            "  Write-Output ($_.Id.ToString().PadLeft(8) + '  ' + $cpu.ToString().PadLeft(10) + 's  ' + $memMB.ToString().PadLeft(8) + 'MB  ' + $_.Name)"
+            "};"
+            "Write-Output '';"
+            "Write-Output ('进程总数: ' + (Get-Process | Measure-Object).Count)"
+            '"'
+        )
+        raw = ssh_exec(cmd, conn_id=conn_id, timeout=20)
+        if raw.startswith("错误") or raw.startswith("连接失败"):
+            return raw
+        header = "      PID        CPU         内存  名称\n"
+        return f"$ 按CPU排序的Top{top_n}进程\n{header}{raw}"
+
+    # Linux 进程查看（ps 命令按 CPU/内存排序）
     sort_field = "-pcpu" if sort_by == "cpu" else "-pmem"
     cmd = f"ps aux --sort={sort_field} | head -n {top_n + 1}"
     raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
@@ -6259,15 +6476,65 @@ def ssh_process_check(sort_by: str = "cpu", top_n: int = 15,
 
 
 def ssh_disk_analyze(path: str = "/", conn_id: str = "default") -> str:
-    """磁盘空间分析（df + du Top10 大目录）。
+    """磁盘空间分析（Linux: df + du；Windows: Get-Volume + Get-ChildItem）。
 
     Args:
-        path: 分析的目录，默认 /
+        path: 分析的目录，默认 /（Windows 默认所有盘符）
         conn_id: SSH 连接ID
 
     Returns:
         磁盘使用情况 + 大目录 Top10
     """
+    os_type = _ssh_detect_os(conn_id)
+
+    if os_type == "windows":
+        # Windows 磁盘分析
+        if path == "/" or not path:
+            # 列出所有盘符
+            vol_cmd = (
+                'powershell -NoProfile -Command "'
+                "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {"
+                "  $totalD = [math]::Round($_.Size/1GB, 1);"
+                "  $freeD = [math]::Round($_.FreeSpace/1GB, 1);"
+                "  $usedD = [math]::Round($totalD - $freeD, 1);"
+                "  $usedPct = if ($totalD -gt 0) { [math]::Round($usedD / $totalD * 100, 1) } else { 0 };"
+                "  Write-Output ($_.DeviceID + '  总:' + $totalD + 'GB  已用:' + $usedD + 'GB  可用:' + $freeD + 'GB  使用率:' + $usedPct + '%')"
+                "}"
+                '"'
+            )
+        else:
+            # 指定盘符
+            drive = path[:2] if len(path) >= 2 else path
+            vol_cmd = (
+                'powershell -NoProfile -Command "'
+                f"Get-CimInstance Win32_LogicalDisk -Filter \\\"DeviceID='{drive}'\\\" | ForEach-Object {{"
+                "  $totalD = [math]::Round($_.Size/1GB, 1);"
+                "  $freeD = [math]::Round($_.FreeSpace/1GB, 1);"
+                "  $usedD = [math]::Round($totalD - $freeD, 1);"
+                "  $usedPct = if ($totalD -gt 0) { [math]::Round($usedD / $totalD * 100, 1) } else { 0 };"
+                "  Write-Output ($_.DeviceID + '  总:' + $totalD + 'GB  已用:' + $usedD + 'GB  可用:' + $freeD + 'GB  使用率:' + $usedPct + '%')"
+                "}"
+                '"'
+            )
+        vol_out = ssh_exec(vol_cmd, conn_id=conn_id, timeout=15)
+
+        # 分析
+        analysis = ""
+        import re
+        for line in vol_out.split("\n"):
+            m = re.search(r"使用率:([\d.]+)%", line)
+            if m:
+                pct = float(m.group(1))
+                if pct >= 90:
+                    analysis += f"\n⚠️ 磁盘使用率 {pct}%（危急，建议立即清理）"
+                elif pct >= 80:
+                    analysis += f"\n⚠️ 磁盘使用率 {pct}%（警告）"
+                elif pct >= 70:
+                    analysis += f"\nℹ️ 磁盘使用率 {pct}%（关注）"
+
+        return f"[磁盘使用]\n$ {vol_cmd}\n{vol_out}{analysis}"
+
+    # Linux 磁盘分析（原有逻辑保留）
     # df 查看整体
     df_cmd = f"df -h {path}"
     df_out = ssh_exec(df_cmd, conn_id=conn_id, timeout=10)
@@ -6298,7 +6565,7 @@ def ssh_disk_analyze(path: str = "/", conn_id: str = "default") -> str:
 
 def ssh_network_diag(action: str = "stats", target: str = "",
                      conn_id: str = "default") -> str:
-    """网络诊断工具集。
+    """网络诊断工具集（Linux: ss/netstat；Windows: Get-NetTCPConnection/netstat/ping）。
 
     Args:
         action: 诊断类型：
@@ -6315,6 +6582,25 @@ def ssh_network_diag(action: str = "stats", target: str = "",
     if action not in ("stats", "ports", "ping", "connections"):
         return "错误：action 必须是 stats / ports / ping / connections 之一"
 
+    os_type = _ssh_detect_os(conn_id)
+
+    if os_type == "windows":
+        if action == "stats":
+            cmd = 'powershell -NoProfile -Command "$tcp = Get-NetTCPConnection -ErrorAction SilentlyContinue; Write-Output (\'TCP连接总数: \' + ($tcp | Measure-Object).Count); Write-Output (\'监听端口数: \' + ($tcp | Where-Object {$_.State -eq \'Listen\'} | Measure-Object).Count); Write-Output (\'已建立连接数: \' + ($tcp | Where-Object {$_.State -eq \'Established\'} | Measure-Object).Count); Write-Output (\'UDP端点数: \' + (Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Measure-Object).Count)"'
+        elif action == "ports":
+            cmd = 'powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, OwningProcess | Sort-Object LocalPort | Format-Table -AutoSize"'
+        elif action == "ping":
+            if not target:
+                return "错误：ping 操作需要 target 参数"
+            if not target.replace(".", "").replace("-", "").isalnum():
+                return "错误：target 仅允许字母数字.-"
+            cmd = f'ping -n 4 -w 2000 {target}'
+        else:  # connections
+            cmd = 'powershell -NoProfile -Command "Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort | Sort-Object RemoteAddress | Format-Table -AutoSize | Out-String -Width 200"'
+        raw = ssh_exec(cmd, conn_id=conn_id, timeout=30 if action == "ping" else 15)
+        return f"$ {cmd}\n{raw}"
+
+    # Linux 网络诊断（原有逻辑保留）
     if action == "stats":
         cmd = "ss -s"
     elif action == "ports":
@@ -6413,6 +6699,27 @@ def ssh_firewall_manage(action: str, port: int = 0, protocol: str = "tcp",
         if not (1 <= int(port) <= 65535):
             return f"错误：port 必须在 1-65535 范围内"
 
+    os_type = _ssh_detect_os(conn_id)
+
+    if os_type == "windows":
+        # Windows 防火墙管理（netsh advfirewall）
+        if action == "status":
+            cmd = "netsh advfirewall show allprofiles state"
+        elif action == "list":
+            cmd = "netsh advfirewall firewall show rule name=all"
+        elif action == "open":
+            cmd = f'netsh advfirewall firewall add rule name="ZeroAI-Allow-{port}-{protocol}" dir=in action=allow protocol={protocol} localport={port}'
+        elif action == "close":
+            cmd = f'netsh advfirewall firewall delete rule name="ZeroAI-Allow-{port}-{protocol}" dir=in protocol={protocol} localport={port}'
+        elif action == "enable":
+            cmd = "netsh advfirewall set allprofiles state on"
+        else:  # disable
+            cmd = "netsh advfirewall set allprofiles state off"
+
+        raw = ssh_exec(cmd, conn_id=conn_id, timeout=15)
+        return f"[Windows 防火墙] $ {cmd}\n{raw}"
+
+    # Linux 防火墙管理（原有逻辑保留）
     # 自动检测防火墙类型
     fw_check = ssh_exec("command -v ufw >/dev/null && echo UFW || (command -v firewall-cmd >/dev/null && echo FIREWALLD || echo IPTABLES)",
                         conn_id=conn_id, timeout=5)
@@ -6484,10 +6791,8 @@ def ssh_health_check(conn_id: str = "default") -> str:
     """
     import re
 
-    # 第一步：检测操作系统（用 echo %OS% 或 uname 同时探测）
-    # Windows 的 %OS% 会输出 Windows_NT，Linux 的 uname 会有 Linux 字样
-    detect = ssh_exec("echo %OS% & uname -s 2>nul", conn_id=conn_id, timeout=10)
-    is_windows = "Windows_NT" in detect
+    # 第一步：检测操作系统（用缓存辅助函数，避免重复探测）
+    is_windows = _ssh_detect_os(conn_id) == "windows"
 
     if is_windows:
         # Windows Server 体检：用 PowerShell 命令（避免 wmic 在 2025 已废弃的问题）
@@ -6966,7 +7271,7 @@ TOOLS = [
             "required": ["host", "user"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_exec", "description": "在远程服务器执行Shell命令（Linux）。需要先ssh_connect。危险命令需confirm_dangerous=true。当用户要求远程执行命令、查看状态、部署时调用。",
+        "name": "ssh_exec", "description": "在远程服务器执行Shell命令（Linux/Windows 自动适配，Windows 下走 cmd/PowerShell）。需要先ssh_connect。危险命令需confirm_dangerous=true。当用户要求远程执行命令、查看状态、部署时调用。",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string", "description": "Shell命令（如 'ls -la /opt'、'systemctl status nginx'）"},
             "conn_id": {"type": "string", "description": "连接ID，默认'default'"},
@@ -7011,7 +7316,7 @@ TOOLS = [
             "additionalProperties": False}}},
     # ====== AI 远程运维工具集（8个）======
     {"type": "function", "function": {
-        "name": "ssh_service_manage", "description": "systemd 服务管理（systemctl 封装）。用户说'查看nginx状态/重启mysql/启动docker/设置开机自启'时调用。返回结果含状态解读。",
+        "name": "ssh_service_manage", "description": "服务管理（Linux 用 systemctl，Windows 用 sc/Get-Service，自动适配操作系统）。用户说'查看服务状态/重启mysql/启动docker/设置开机自启/看看服务器运行了什么'时调用。返回结果含状态解读。支持 service='all' + action='status' 列出所有运行中的服务。",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["status", "start", "stop", "restart", "reload", "enable", "disable", "is-active", "is-enabled"], "description": "操作类型"},
             "service": {"type": "string", "description": "服务名，如 nginx、mysql、docker、ssh、redis"},
@@ -7019,7 +7324,7 @@ TOOLS = [
             "required": ["action", "service"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_log_view", "description": "查看远程日志（journalctl / syslog 封装）。用户说'看nginx日志/查错误/查mysql日志/搜error关键词'时调用。返回结果含自动异常统计。",
+        "name": "ssh_log_view", "description": "查看远程日志（Linux: journalctl/syslog；Windows: Get-EventLog 事件日志，自动适配）。用户说'看nginx日志/查错误/查mysql日志/搜error关键词'时调用。返回结果含自动异常统计。",
         "parameters": {"type": "object", "properties": {
             "service": {"type": "string", "description": "服务名（如 nginx）——若提供则用 journalctl -u，否则查看 syslog/messages"},
             "lines": {"type": "integer", "description": "查看最后N行，默认100，范围10-1000"},
@@ -7029,7 +7334,7 @@ TOOLS = [
             "required": [],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_process_check", "description": "查看远程服务器进程（按 CPU/内存排序）。用户说'看进程/CPU占用/内存占用/谁在占用资源'时调用。",
+        "name": "ssh_process_check", "description": "查看远程服务器进程（按 CPU/内存排序，Linux: ps；Windows: Get-Process，自动适配）。用户说'看进程/CPU占用/内存占用/谁在占用资源'时调用。",
         "parameters": {"type": "object", "properties": {
             "sort_by": {"type": "string", "enum": ["cpu", "mem"], "description": "排序方式，默认cpu"},
             "top_n": {"type": "integer", "description": "返回前N个进程，默认15，范围5-50"},
@@ -7037,14 +7342,14 @@ TOOLS = [
             "required": [],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_disk_analyze", "description": "磁盘空间分析（df + du Top10 大目录）。用户说'看磁盘/磁盘满了/谁占了磁盘'时调用。",
+        "name": "ssh_disk_analyze", "description": "磁盘空间分析（Linux: df+du Top10；Windows: Get-Volume/Get-ChildItem，自动适配）。用户说'看磁盘/磁盘满了/谁占了磁盘'时调用。",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "分析的目录，默认'/'"},
             "conn_id": {"type": "string", "description": "SSH连接ID，默认'default'"}},
             "required": [],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_network_diag", "description": "网络诊断工具集。用户说'看端口/查看网络/能不能ping通/查看监听端口'时调用。",
+        "name": "ssh_network_diag", "description": "网络诊断工具集（Linux: ss/netstat；Windows: Get-NetTCPConnection，自动适配）。用户说'看端口/查看网络/能不能ping通/查看监听端口'时调用。",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["stats", "ports", "ping", "connections"], "description": "诊断类型：stats=网络统计/ports=监听端口/ping=ping目标/connections=活跃连接"},
             "target": {"type": "string", "description": "ping操作的目标主机（IP/域名），仅action=ping时必填"},
@@ -7060,7 +7365,7 @@ TOOLS = [
             "required": ["action"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_firewall_manage", "description": "防火墙统一管理（自动识别 ufw/firewalld/iptables）。用户说'开端口/关端口/看防火墙/放行80端口'时调用。",
+        "name": "ssh_firewall_manage", "description": "防火墙统一管理（Linux: 自动识别 ufw/firewalld/iptables；Windows: netsh advfirewall，自动适配）。用户说'开端口/关端口/看防火墙/放行80端口'时调用。",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["status", "list", "open", "close", "enable", "disable"], "description": "操作类型：status=状态/list=规则列表/open=开放端口/close=关闭端口/enable/disable=启用禁用"},
             "port": {"type": "integer", "description": "端口号（open/close时必填，范围1-65535）"},
@@ -7069,7 +7374,7 @@ TOOLS = [
             "required": ["action"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "ssh_health_check", "description": "服务器一键健康体检。用户说'体检/检查服务器/服务器怎么样/有没有问题'时调用。返回综合报告（系统/CPU/内存/磁盘/网络/负载/失败服务/错误日志）+ AI健康分析。",
+        "name": "ssh_health_check", "description": "服务器一键健康体检（自动检测操作系统，支持 Linux 和 Windows Server）。用户说'体检/检查服务器/服务器怎么样/有没有问题/看看服务器运行了什么'时调用。返回综合报告（系统/CPU/内存/磁盘/网络/负载/失败服务/错误日志）+ AI健康分析。",
         "parameters": {"type": "object", "properties": {
             "conn_id": {"type": "string", "description": "SSH连接ID，默认'default'"}},
             "required": [],
@@ -7165,23 +7470,23 @@ TOOL_USAGE_RULES = """# 工具使用规则
 - `open_app(name)`：打开应用/文件（自动搜索本地，无需自定义路径）
 
 ## SSH 远程部署（7 个）
-- `ssh_connect(host, user, password, key_path, port, conn_id)`：连接远程 Linux 服务器（支持密码/密钥认证）。用户说"连接服务器/SSH部署/远程部署"时用
-- `ssh_exec(command, conn_id, timeout, confirm_dangerous)`：在远程服务器执行命令。危险命令（rm -rf /、mkfs、dd 等）需 confirm_dangerous=true 二次确认
-- `ssh_upload(local_path, remote_path, conn_id)`：上传文件到远程服务器（SFTP，自动 chmod 644）
+- `ssh_connect(host, user, password, key_path, port, conn_id)`：连接远程服务器（Linux/Windows 均可，支持密码/密钥认证）。用户说"连接服务器/SSH部署/远程部署"时用
+- `ssh_exec(command, conn_id, timeout, confirm_dangerous)`：在远程服务器执行命令（自动适配 Linux/Windows）。危险命令（rm -rf /、mkfs、dd、format 等）需 confirm_dangerous=true 二次确认
+- `ssh_upload(local_path, remote_path, conn_id)`：上传文件到远程服务器（SFTP，Linux 自动 chmod 644）
 - `ssh_download(remote_path, local_path, conn_id)`：从远程服务器下载文件（SFTP，自动创建本地目录）
 - `ssh_deploy(deploy_config, conn_id)`：一键自动化部署（pre_check→mkdir→upload→install→restart→health_check→post_cmds 7步骤，生成部署报告）
 - `ssh_list(conn_id)`：查看当前 SSH 连接状态和审计日志
 - `ssh_disconnect(conn_id)`：断开 SSH 连接
 
-## AI 远程运维（8 个）— 语义化运维工具，优先调用而非手拼命令
-- `ssh_service_manage(action, service, conn_id)`：systemd 服务管理。用户说"看nginx状态/重启mysql/启动docker/开机自启"时用
-- `ssh_log_view(service, lines, follow, keyword, conn_id)`：查看远程日志。用户说"看日志/查错误/搜error关键词"时用，返回自动异常统计
-- `ssh_process_check(sort_by, top_n, conn_id)`：进程查看。用户说"看进程/CPU占用/内存占用/谁占资源"时用
-- `ssh_disk_analyze(path, conn_id)`：磁盘分析。用户说"看磁盘/磁盘满了/谁占磁盘"时用，自动标注危急/警告
-- `ssh_network_diag(action, target, conn_id)`：网络诊断。用户说"看端口/ping/监听端口/网络连接"时用
-- `ssh_docker_manage(action, container, conn_id)`：Docker 管理。用户说"看容器/重启容器/docker日志"时用
-- `ssh_firewall_manage(action, port, protocol, conn_id)`：防火墙统一管理（自动识别 ufw/firewalld/iptables）。用户说"开端口/关端口/看防火墙"时用
-- `ssh_health_check(conn_id)`：一键健康体检。用户说"体检/检查服务器/有问题吗"时用，返回综合报告+AI分析
+## AI 远程运维（8 个）— 语义化运维工具，自动适配 Linux/Windows，优先调用而非手拼命令
+- `ssh_service_manage(action, service, conn_id)`：服务管理（Linux: systemctl；Windows: sc/Get-Service）。用户说"看nginx状态/重启mysql/启动docker/开机自启/看看服务器运行了什么"时用。支持 service='all' 列出所有运行中的服务
+- `ssh_log_view(service, lines, follow, keyword, conn_id)`：查看远程日志（Linux: journalctl；Windows: Get-EventLog）。用户说"看日志/查错误/搜error关键词"时用，返回自动异常统计
+- `ssh_process_check(sort_by, top_n, conn_id)`：进程查看（Linux: ps；Windows: Get-Process）。用户说"看进程/CPU占用/内存占用/谁占资源"时用
+- `ssh_disk_analyze(path, conn_id)`：磁盘分析（Linux: df+du；Windows: Get-Volume）。用户说"看磁盘/磁盘满了/谁占磁盘"时用，自动标注危急/警告
+- `ssh_network_diag(action, target, conn_id)`：网络诊断（Linux: ss/netstat；Windows: Get-NetTCPConnection）。用户说"看端口/ping/监听端口/网络连接"时用
+- `ssh_docker_manage(action, container, conn_id)`：Docker 管理（跨平台一致）。用户说"看容器/重启容器/docker日志"时用
+- `ssh_firewall_manage(action, port, protocol, conn_id)`：防火墙统一管理（Linux: ufw/firewalld/iptables；Windows: netsh advfirewall）。用户说"开端口/关端口/看防火墙"时用
+- `ssh_health_check(conn_id)`：一键健康体检（自动检测操作系统，支持 Linux 和 Windows Server）。用户说"体检/检查服务器/有问题吗/看看服务器运行了什么"时用，返回综合报告+AI分析
 
 ## 学术研究（5 个）
 - `academic_search(query, num_results, year_from, year_to, sort_by)`：学术文献搜索（Semantic Scholar 2亿+论文，含引用数/影响力/DOI）。查论文/文献/引用时用
@@ -7219,14 +7524,14 @@ TOOL_USAGE_RULES = """# 工具使用规则
 
 **AI 远程运维工具调用规则（重要！优先于 ssh_exec）**：
 当用户提出运维需求时，**必须优先调用语义化的运维工具**，而不是手拼 `ssh_exec` 命令。
-26. 用户说"看XX服务状态/重启XX/启动XX/开机自启" → `ssh_service_manage`（不要用 ssh_exec 跑 systemctl）
-27. 用户说"看XX日志/查错误/搜error/搜fail关键词" → `ssh_log_view`（不要用 ssh_exec 跑 journalctl）
-28. 用户说"看进程/CPU占用/内存占用/谁占资源" → `ssh_process_check`（不要用 ssh_exec 跑 ps/top）
-29. 用户说"看磁盘/磁盘满了/谁占磁盘/空间不足" → `ssh_disk_analyze`（不要用 ssh_exec 跑 df/du）
-30. 用户说"看端口/ping/监听端口/网络连接" → `ssh_network_diag`（不要用 ssh_exec 跑 ss/netstat/ping）
+26. 用户说"看XX服务状态/重启XX/启动XX/开机自启/看看服务器运行了什么/服务器跑了什么服务" → `ssh_service_manage`（不要用 ssh_exec 跑 systemctl/sc/Get-Service。工具会自动检测操作系统并适配）
+27. 用户说"看XX日志/查错误/搜error/搜fail关键词" → `ssh_log_view`（不要用 ssh_exec 跑 journalctl/Get-EventLog。工具会自动适配）
+28. 用户说"看进程/CPU占用/内存占用/谁占资源" → `ssh_process_check`（不要用 ssh_exec 跑 ps/top/Get-Process。工具会自动适配）
+29. 用户说"看磁盘/磁盘满了/谁占磁盘/空间不足" → `ssh_disk_analyze`（不要用 ssh_exec 跑 df/du/Get-Volume。工具会自动适配）
+30. 用户说"看端口/ping/监听端口/网络连接" → `ssh_network_diag`（不要用 ssh_exec 跑 ss/netstat/Get-NetTCPConnection。工具会自动适配）
 31. 用户说"看容器/重启容器/docker日志/容器列表" → `ssh_docker_manage`（不要用 ssh_exec 跑 docker）
-32. 用户说"开端口/关端口/看防火墙/放行XX端口" → `ssh_firewall_manage`（不要用 ssh_exec 跑 ufw/firewall-cmd/iptables）
-33. 用户说"体检/检查服务器/服务器怎么样/有没有问题/卡不卡" → `ssh_health_check`（综合诊断，一次搞定）
+32. 用户说"开端口/关端口/看防火墙/放行XX端口" → `ssh_firewall_manage`（不要用 ssh_exec 跑 ufw/firewall-cmd/iptables/netsh。工具会自动适配）
+33. 用户说"体检/检查服务器/服务器怎么样/有没有问题/卡不卡/看看服务器运行了什么" → `ssh_health_check`（综合诊断，一次搞定，自动检测操作系统）
 34. **运维决策链**：用户说"服务器卡了" → 先 `ssh_health_check` 综合体检 → 根据 AI 分析 → 再针对性调用 `ssh_process_check`/`ssh_log_view`/`ssh_disk_analyze` 深入
 35. **运维排错链**：用户说"XX服务挂了" → 先 `ssh_service_manage(action=status, service=XX)` 看状态 → 若失败 → `ssh_log_view(service=XX, keyword=error)` 查错误日志 → 定位问题
 
@@ -7389,26 +7694,27 @@ TOOL_CAPABILITY_PROMPT = """# ZeroAI 子模块能力声明（重要 - 必读）
 SYSTEM_PROMPT = f"""# 角色
 你是 ZeroAI，一个专业的终端 AI 编程助手。你在用户的终端中运行，**可以完全访问本地文件系统**（读取/写入/搜索/浏览目录），可以执行命令、搜索代码、联网搜索、生成 Word/Excel/PDF 文档、安全审计等。
 
-# SSH 远程部署 + AI 远程运维（已启用）
-你具备远程 Linux 服务器**部署 + 运维**双重能力，可帮用户**远程部署其他项目 + 远程运维服务器**：
+# SSH 远程部署 + AI 远程运维（已启用，跨平台支持 Linux 和 Windows Server）
+你具备远程服务器（**Linux 和 Windows 均可**）**部署 + 运维**双重能力，可帮用户**远程部署其他项目 + 远程运维服务器**：
 
 ## 远程部署能力（7 个工具）
 - **多服务器并行连接**：通过 conn_id 区分不同服务器，支持密码/密钥认证
-- **远程命令执行**：在服务器上执行任意命令，危险命令（rm -rf /、mkfs、dd 等）必须二次确认
+- **远程命令执行**：在服务器上执行任意命令（Linux/Windows 自动适配），危险命令（rm -rf /、mkfs、dd、format 等）必须二次确认
 - **SFTP 文件传输**：上传/下载文件，自动设置权限
 - **一键自动化部署**：ssh_deploy 支持 pre_check → mkdir → upload → install → restart → health_check → post_cmds 7 步骤
 - **审计日志**：所有 SSH 操作自动记录（最多 200 条），可通过 ssh_list 查看
 - **安全设计**：主机地址校验、危险命令黑名单、内网IP可选阻断、输出截断保护
 
-## AI 远程运维能力（8 个语义化工具，优先调用而非手拼命令）
-- **服务管理**：ssh_service_manage（systemctl 封装：status/start/stop/restart/enable）
-- **日志分析**：ssh_log_view（journalctl 封装，自动统计错误密度）
-- **进程查看**：ssh_process_check（按 CPU/内存排序 Top N）
-- **磁盘分析**：ssh_disk_analyze（df + du Top10，自动标注危急/警告）
-- **网络诊断**：ssh_network_diag（端口/连接/ping/统计）
-- **Docker 管理**：ssh_docker_manage（容器/镜像/日志/资源）
-- **防火墙管理**：ssh_firewall_manage（自动识别 ufw/firewalld/iptables）
-- **一键体检**：ssh_health_check（综合报告 + AI 健康分析 + 异常项标注）
+## AI 远程运维能力（8 个语义化工具，自动适配 Linux/Windows，优先调用而非手拼命令）
+**重要**：所有 SSH 运维工具都会通过 `_ssh_detect_os` 自动检测远程操作系统（Linux/Windows），并切换到对应命令。AI 无需关心远程是 Linux 还是 Windows，直接调用语义化工具即可。
+- **服务管理**：ssh_service_manage（Linux: systemctl；Windows: sc/Get-Service。支持 status/start/stop/restart/enable）
+- **日志分析**：ssh_log_view（Linux: journalctl；Windows: Get-EventLog 事件日志，自动统计错误密度）
+- **进程查看**：ssh_process_check（Linux: ps；Windows: Get-Process，按 CPU/内存排序 Top N）
+- **磁盘分析**：ssh_disk_analyze（Linux: df+du Top10；Windows: Get-Volume，自动标注危急/警告）
+- **网络诊断**：ssh_network_diag（Linux: ss/netstat；Windows: Get-NetTCPConnection，端口/连接/ping/统计）
+- **Docker 管理**：ssh_docker_manage（容器/镜像/日志/资源，跨平台一致）
+- **防火墙管理**：ssh_firewall_manage（Linux: 自动识别 ufw/firewalld/iptables；Windows: netsh advfirewall）
+- **一键体检**：ssh_health_check（自动检测操作系统，综合报告 + AI 健康分析 + 异常项标注，支持 Linux 和 Windows Server）
 
 ## 运维决策链（AI 自主诊断流程）
 当用户描述模糊问题（"服务器卡了"/"网站打不开"/"服务异常"）时：
