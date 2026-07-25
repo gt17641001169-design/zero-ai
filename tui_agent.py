@@ -6290,6 +6290,255 @@ def ssh_deploy(deploy_config: dict, conn_id: str = "default") -> str:
     return _ssh_format_prefix(conn_id) + "\n" + "\n".join(report)
 
 
+def ssh_setup_samba_share(share_name: str = "shared",
+                          share_path: str = "/srv/shared",
+                          access_mode: str = "guest_rw",
+                          samba_password: str = "",
+                          conn_id: str = "default") -> str:
+    """一键配置 Samba 共享文件夹（Linux 服务器专用，自动完成全部步骤）。
+
+    自动执行的 8 个步骤：
+    1. 检测操作系统（必须是 Linux，Windows 应该用 New-SmbShare）
+    2. 安装 Samba（自动识别 apt/yum/dnf 包管理器）
+    3. 创建共享文件夹并设置权限
+    4. 备份原 smb.conf
+    5. 写入共享配置（支持 guest_ro/guest_rw/user_rw 三种权限模式）
+    6. 设置 Samba 密码（user_rw 模式需要）
+    7. 启动 smbd/nmb 服务并设置开机自启
+    8. 防火墙放行 + SELinux 处理 + 验证共享
+
+    Args:
+        share_name: 共享名（Windows 访问时用，如 "shared"，访问路径 \\\\IP\\shared）
+        share_path: 共享文件夹在 Linux 上的路径，默认 /srv/shared
+        access_mode: 权限模式：
+            - guest_ro: 匿名只读（任何人可读不可写）
+            - guest_rw: 匿名读写（任何人可读写，适合内网共享，默认）
+            - user_rw: 用户认证读写（需 samba_password，更安全）
+        samba_password: Samba 密码（user_rw 模式必填，其他模式可留空）
+        conn_id: SSH 连接ID
+
+    Returns:
+        配置结果报告 + Windows 访问路径
+    """
+    import base64
+
+    prefix = _ssh_format_prefix(conn_id)
+
+    # 步骤1: 检测操作系统
+    os_type = _ssh_detect_os(conn_id)
+    if os_type == "windows":
+        return (f"{prefix}\n❌ 此工具仅支持 Linux 服务器配置 Samba 共享。\n"
+                f"Windows Server 请用 ssh_exec 执行 PowerShell 命令：\n"
+                f"  New-SmbShare -Name '{share_name}' -Path 'D:\\{share_name}' -FullAccess Everyone")
+
+    report = [
+        "=" * 50,
+        f"Samba 共享一键配置报告",
+        f"  共享名: {share_name}",
+        f"  共享路径: {share_path}",
+        f"  权限模式: {access_mode}",
+        "=" * 50,
+    ]
+    step = 0
+    total_steps = 8
+
+    # 步骤2: 安装 Samba（自动识别包管理器）
+    step += 1
+    report.append(f"\n[{step}/{total_steps}] 安装 Samba...")
+    install_cmd = (
+        'if command -v apt-get >/dev/null 2>&1; then '
+        '  apt-get update -qq 2>&1 | tail -1; apt-get install -y -qq samba 2>&1 | tail -3; '
+        'elif command -v dnf >/dev/null 2>&1; then '
+        '  dnf install -y samba 2>&1 | tail -3; '
+        'elif command -v yum >/dev/null 2>&1; then '
+        '  yum install -y samba 2>&1 | tail -3; '
+        'else echo "错误：未识别的包管理器（apt/dnf/yum 均不存在）"; exit 1; fi; '
+        'which smbd && smbd --version'
+    )
+    r = ssh_exec(install_cmd, conn_id, _internal=True, timeout=180)
+    if "smbd" not in r or "Version" not in r:
+        report.append(f"  ❌ Samba 安装失败:\n{r[-500:]}")
+        report.append("\n" + "=" * 50)
+        report.append("❌ 配置失败，请检查包管理器或网络")
+        return prefix + "\n" + "\n".join(report)
+    report.append(f"  ✅ Samba 已安装: {r.split('Version')[-1].strip() if 'Version' in r else '已就绪'}")
+
+    # 步骤3: 创建共享文件夹
+    step += 1
+    report.append(f"\n[{step}/{total_steps}] 创建共享文件夹 {share_path}...")
+    r = ssh_exec(f'mkdir -p {share_path} && chmod 777 {share_path} && ls -ld {share_path}',
+                 conn_id, _internal=True, timeout=10)
+    if "drwx" not in r:
+        report.append(f"  ❌ 文件夹创建失败:\n{r[-300:]}")
+        return prefix + "\n" + "\n".join(report)
+    report.append(f"  ✅ 文件夹已创建: {r.split('drwx')[0].strip() or r.strip().split(chr(10))[-1]}")
+
+    # 步骤4: 备份原 smb.conf
+    step += 1
+    report.append(f"\n[{step}/{total_steps}] 备份原 smb.conf...")
+    r = ssh_exec('cp /etc/samba/smb.conf /etc/samba/smb.conf.bak.$(date +%s) 2>/dev/null && echo "备份成功" || echo "无需备份（首次配置）"',
+                 conn_id, _internal=True, timeout=10)
+    report.append(f"  ✅ {r.strip().split(chr(10))[-1]}")
+
+    # 步骤5: 写入共享配置（根据权限模式生成不同配置）
+    step += 1
+    report.append(f"\n[{step}/{total_steps}] 写入共享配置（权限模式: {access_mode}）...")
+
+    if access_mode == "guest_ro":
+        # 匿名只读
+        share_config = f"""[global]
+   workgroup = WORKGROUP
+   security = user
+   map to guest = Bad User
+   passdb backend = tdbsam
+   printing = bsd
+   printcap name = /dev/null
+   load printers = no
+
+[{share_name}]
+   comment = Shared Folder
+   path = {share_path}
+   browseable = yes
+   writable = no
+   guest ok = yes
+   read only = yes
+"""
+    elif access_mode == "guest_rw":
+        # 匿名读写（默认，内网共享推荐）
+        share_config = f"""[global]
+   workgroup = WORKGROUP
+   security = user
+   map to guest = Bad User
+   passdb backend = tdbsam
+   printing = bsd
+   printcap name = /dev/null
+   load printers = no
+
+[{share_name}]
+   comment = Shared Folder
+   path = {share_path}
+   browseable = yes
+   writable = yes
+   guest ok = yes
+   force user = root
+   force group = root
+   create mask = 0666
+   directory mask = 0777
+"""
+    else:  # user_rw
+        # 用户认证读写（更安全）
+        share_config = f"""[global]
+   workgroup = WORKGROUP
+   security = user
+   passdb backend = tdbsam
+   printing = bsd
+   printcap name = /dev/null
+   load printers = no
+
+[{share_name}]
+   comment = Shared Folder
+   path = {share_path}
+   browseable = yes
+   writable = yes
+   guest ok = no
+   valid users = root
+   create mask = 0664
+   directory mask = 0775
+"""
+
+    b64 = base64.b64encode(share_config.encode('utf-8')).decode('ascii')
+    r = ssh_exec(f'echo "{b64}" | base64 -d > /etc/samba/smb.conf && testparm -s 2>&1 | head -20',
+                 conn_id, _internal=True, timeout=10)
+    if "Loaded services file" not in r and "[" + share_name + "]" not in r:
+        report.append(f"  ❌ 配置写入失败:\n{r[-400:]}")
+        return prefix + "\n" + "\n".join(report)
+    report.append(f"  ✅ 配置已写入，testparm 校验通过")
+
+    # 步骤6: 设置 Samba 密码（user_rw 模式）
+    step += 1
+    if access_mode == "user_rw":
+        report.append(f"\n[{step}/{total_steps}] 设置 Samba 密码 (root)...")
+        if not samba_password:
+            report.append("  ⚠️ user_rw 模式未提供密码，跳过（可用 smbpasswd -a root 手动设置）")
+        else:
+            # 用单引号包裹密码避免特殊字符问题
+            r = ssh_exec(f'(echo "{samba_password}"; echo "{samba_password}") | smbpasswd -a root -s 2>&1',
+                         conn_id, _internal=True, timeout=10)
+            if "Added user" in r:
+                report.append(f"  ✅ Samba 密码已设置 (root)")
+            else:
+                report.append(f"  ⚠️ 密码设置失败: {r.strip()[-200:]}")
+    else:
+        report.append(f"\n[{step}/{total_steps}] 跳过密码设置（{access_mode} 模式无需密码）")
+
+    # 步骤7: 启动 smbd/nmb 服务 + 开机自启
+    step += 1
+    report.append(f"\n[{step}/{total_steps}] 启动 smbd/nmb 服务 + 开机自启...")
+    r = ssh_exec('systemctl enable --now smb nmb 2>&1 | tail -2; systemctl is-active smb nmb; systemctl is-enabled smb nmb',
+                 conn_id, _internal=True, timeout=15)
+    if "active" not in r:
+        report.append(f"  ❌ 服务启动失败:\n{r[-300:]}")
+        return prefix + "\n" + "\n".join(report)
+    report.append(f"  ✅ smbd/nmb 已启动并设为开机自启")
+
+    # 步骤8: 防火墙放行 + SELinux 处理 + 验证
+    step += 1
+    report.append(f"\n[{step}/{total_steps}] 防火墙放行 + SELinux 处理...")
+
+    # 防火墙
+    r_fw = ssh_exec('systemctl is-active firewalld 2>/dev/null && '
+                    '(firewall-cmd --permanent --add-service=samba 2>&1; firewall-cmd --reload 2>&1) || '
+                    'echo "firewalld 未运行，跳过"',
+                    conn_id, _internal=True, timeout=15)
+    if "success" in r_fw:
+        report.append("  ✅ 防火墙已放行 Samba 服务")
+    else:
+        report.append(f"  ℹ️ 防火墙: {r_fw.strip().split(chr(10))[-1]}")
+
+    # SELinux
+    r_se = ssh_exec('getenforce 2>/dev/null || echo "Disabled"',
+                    conn_id, _internal=True, timeout=10)
+    se_status = r_se.strip().split(chr(10))[-1] if r_se else "Disabled"
+    if se_status == "Enforcing":
+        ssh_exec(f'setsebool -P samba_enable_home_dirs on 2>/dev/null; '
+                 f'semanage fcontext -a -t samba_share_t "{share_path}(/.*)?" 2>/dev/null; '
+                 f'restorecon -Rv {share_path} 2>&1 | tail -1',
+                 conn_id, _internal=True, timeout=15)
+        report.append("  ✅ SELinux 上下文已设置")
+    else:
+        report.append(f"  ℹ️ SELinux: {se_status}（无需处理）")
+
+    # 验证共享
+    r_test = ssh_exec(f'echo "Samba 共享测试 $(date)" > {share_path}/test.txt && ls -l {share_path}/test.txt',
+                      conn_id, _internal=True, timeout=10)
+    if "test.txt" in r_test:
+        report.append(f"  ✅ 共享写入测试通过")
+
+    # 获取服务器 IP
+    info = _SSH_CONNECTIONS.get(conn_id, {})
+    host = info.get("host", "服务器IP")
+    remark = info.get("remark", "")
+
+    # 最终报告
+    report.append("\n" + "=" * 50)
+    report.append("✅ Samba 共享配置完成！")
+    report.append("=" * 50)
+    report.append(f"\n【访问方式】")
+    report.append(f"  Windows 资源管理器地址栏输入:")
+    report.append(f"    \\\\{host}\\{share_name}")
+    if access_mode == "user_rw":
+        report.append(f"  用户名: root")
+        report.append(f"  密码: {samba_password or '（请用 smbpasswd -a root 设置）'}")
+    else:
+        report.append(f"  权限: {'读写' if access_mode == 'guest_rw' else '只读'}（无需密码）")
+    if remark:
+        report.append(f"\n【服务器备注】{remark}")
+    report.append(f"\n【共享路径】{share_path}")
+    report.append(f"【配置文件】/etc/samba/smb.conf（原配置已备份为 smb.conf.bak.*）")
+
+    return prefix + "\n" + "\n".join(report)
+
+
 def ssh_list(conn_id: str = "") -> str:
     """查看SSH连接状态和审计日志。
 
@@ -7500,6 +7749,16 @@ TOOLS = [
             "required": ["deploy_config"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
+        "name": "ssh_setup_samba_share", "description": "一键配置 Samba 共享文件夹（Linux 服务器专用，8 步骤自动完成：安装+配置+启动+防火墙+SELinux+验证）。当用户说'共享文件夹/配置Samba/让Windows能访问Linux文件/文件共享/SMB共享'时调用。Windows Server 共享请用 ssh_exec 执行 New-SmbShare。",
+        "parameters": {"type": "object", "properties": {
+            "share_name": {"type": "string", "description": "共享名（Windows 访问时用，如 'shared'，访问路径 \\\\IP\\shared），默认 'shared'"},
+            "share_path": {"type": "string", "description": "共享文件夹在 Linux 上的路径，默认 '/srv/shared'"},
+            "access_mode": {"type": "string", "enum": ["guest_ro", "guest_rw", "user_rw"], "description": "权限模式：guest_ro=匿名只读 / guest_rw=匿名读写（内网推荐，默认）/ user_rw=用户认证读写（需密码，更安全）"},
+            "samba_password": {"type": "string", "description": "Samba 密码（仅 user_rw 模式必填，其他模式留空）"},
+            "conn_id": {"type": "string", "description": "SSH连接ID，默认'default'"}},
+            "required": [],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
         "name": "ssh_list", "description": "查看SSH连接状态和操作审计日志。当用户问连接状态、SSH审计、操作记录时调用。留空查看所有连接。",
         "parameters": {"type": "object", "properties": {
             "conn_id": {"type": "string", "description": "指定连接ID查看详情，留空查看全部"}},
@@ -7672,6 +7931,7 @@ TOOL_USAGE_RULES = """# 工具使用规则
 - `ssh_upload(local_path, remote_path, conn_id)`：上传文件到远程服务器（SFTP，Linux 自动 chmod 644）
 - `ssh_download(remote_path, local_path, conn_id)`：从远程服务器下载文件（SFTP，自动创建本地目录）
 - `ssh_deploy(deploy_config, conn_id)`：一键自动化部署（pre_check→mkdir→upload→install→restart→health_check→post_cmds 7步骤，生成部署报告）
+- `ssh_setup_samba_share(share_name, share_path, access_mode, samba_password, conn_id)`：一键配置 Samba 共享（8步骤：安装+配置+启动+防火墙+SELinux+验证）。用户说"共享文件夹/配置Samba/文件共享/SMB共享"时用。**不要用 ssh_exec 手动拼命令，直接调这个工具一次搞定**
 - `ssh_list(conn_id)`：查看当前 SSH 连接状态和审计日志
 - `ssh_disconnect(conn_id)`：断开 SSH 连接
 
@@ -7716,6 +7976,7 @@ TOOL_USAGE_RULES = """# 工具使用规则
 21. 用户说"上传到服务器/部署文件" → `ssh_upload`（SFTP 传输）
 22. 用户说"从服务器下载/拉取" → `ssh_download`
 23. 用户说"一键部署/自动化部署" → `ssh_deploy`（deploy_config 配置 7 步骤）
+23.5. 用户说"共享文件夹/配置Samba/文件共享/SMB共享/让Windows访问Linux文件/共享目录" → `ssh_setup_samba_share`（**一键完成，不要用 ssh_exec 手动拼命令**）。默认 guest_rw 匿名读写，用户要求安全才用 user_rw + 密码
 24. 用户问"SSH连接状态/审计日志" → `ssh_list`
 25. 用户说"断开SSH/关闭连接" → `ssh_disconnect`
 
@@ -7914,13 +8175,59 @@ SYSTEM_PROMPT = f"""# 角色
 # SSH 远程部署 + AI 远程运维（已启用，跨平台支持 Linux 和 Windows Server）
 你具备远程服务器（**Linux 和 Windows 均可**）**部署 + 运维**双重能力，可帮用户**远程部署其他项目 + 远程运维服务器**：
 
-## 远程部署能力（7 个工具）
+## 远程部署能力（8 个工具）
 - **多服务器并行连接**：通过 conn_id 区分不同服务器，支持密码/密钥认证
 - **远程命令执行**：在服务器上执行任意命令（Linux/Windows 自动适配），危险命令（rm -rf /、mkfs、dd、format 等）必须二次确认
 - **SFTP 文件传输**：上传/下载文件，自动设置权限
 - **一键自动化部署**：ssh_deploy 支持 pre_check → mkdir → upload → install → restart → health_check → post_cmds 7 步骤
+- **一键 Samba 共享**：ssh_setup_samba_share 一键完成 Linux Samba 共享配置（8 步骤：安装+配置+启动+防火墙+SELinux+验证）
 - **审计日志**：所有 SSH 操作自动记录（最多 200 条），可通过 ssh_list 查看
 - **安全设计**：主机地址校验、危险命令黑名单、内网IP可选阻断、输出截断保护
+
+## ⚠️ 核心原则：命令必须直接执行，禁止输出命令文本给用户（最高优先级！）
+**这是 ZeroAI 与传统 AI 助手的根本区别**：你能想出来的所有命令，**必须直接调用 ssh_exec 工具执行**，绝对不能把命令文本输出给用户让用户手动执行。
+
+### ❌ 严禁的行为（错误示例）
+```
+用户：帮我创建一个共享文件夹
+AI：好的，请执行以下命令：
+    mkdir /srv/shared        ← ❌ 错！不能输出命令让用户执行
+    chmod 777 /srv/shared    ← ❌ 错！不能输出命令让用户执行
+    yum install samba        ← ❌ 错！不能输出命令让用户执行
+```
+
+### ✅ 正确的行为（直接调用工具执行）
+```
+用户：帮我创建一个共享文件夹
+AI：（直接调用 ssh_setup_samba_share 工具，一次完成所有步骤）
+    → 工具返回：✅ Samba 共享配置完成，访问路径 \\192.168.71.132\shared
+AI：已完成！Windows 资源管理器输入 \\192.168.71.132\shared 即可访问
+```
+
+### 命令执行的 3 个层次（按优先级）
+1. **专用一键工具**（首选）：有专用工具的任务必须用专用工具
+   - 共享文件夹 → `ssh_setup_samba_share`（不要用 ssh_exec 拼）
+   - 项目部署 → `ssh_deploy`（不要用 ssh_exec 拼）
+   - 服务状态/进程/磁盘/端口/体检 → 对应的语义化工具
+
+2. **ssh_exec 通用执行**（次选）：没有专用工具的任务，直接用 ssh_exec 执行
+   - 用户说"安装 nginx" → `ssh_exec("apt install -y nginx || yum install -y nginx", conn_id="xxx")`
+   - 用户说"创建目录 /data" → `ssh_exec("mkdir -p /data", conn_id="xxx")`
+   - 用户说"修改配置文件" → `ssh_exec("sed -i 's/old/new/g' /etc/config.conf", conn_id="xxx")`
+   - 用户说"查看日志" → `ssh_exec("tail -100 /var/log/messages", conn_id="xxx")`
+
+3. **多步骤任务**：拆解成多个 ssh_exec 调用，逐步执行，每步检查结果
+   - 示例"配置 Nginx 反向代理"：
+     1. `ssh_exec("yum install -y nginx", conn_id="web1")` → 检查是否成功
+     2. `ssh_exec("cat > /etc/nginx/conf.d/proxy.conf << 'EOF' ... EOF", conn_id="web1")` → 写入配置
+     3. `ssh_exec("nginx -t && systemctl reload nginx", conn_id="web1")` → 测试并重载
+   - 每步根据上一步结果决定下一步，失败就调整方案
+
+### 关键规则
+- **绝对不能输出命令文本给用户**：任何命令都必须通过工具执行，不能写成"请执行：xxx"
+- **危险命令二次确认**：rm -rf /、mkfs、dd、format、shutdown 等破坏性命令，调用时必须 `confirm_dangerous=true`
+- **查询类命令直接执行**：netstat、ipconfig、tasklist、ps、df、systemctl status 等查询命令无需确认直接执行
+- **失败要自我修复**：如果命令执行失败，分析错误原因，调整命令重试，不要把错误抛给用户
 
 ## AI 远程运维能力（8 个语义化工具，自动适配 Linux/Windows，优先调用而非手拼命令）
 **重要**：所有 SSH 运维工具都会通过 `_ssh_detect_os` 自动检测远程操作系统（Linux/Windows），并切换到对应命令。AI 无需关心远程是 Linux 还是 Windows，直接调用语义化工具即可。
