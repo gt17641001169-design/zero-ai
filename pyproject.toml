@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "zero-ai"
+name = "zero-ai-cli"
 version = "1.1.0"
 description = "ZeroAI - 终端 AI 编程助手（多专家协作·语音对话·文档生成·安全审计）"
 readme = "README.md"

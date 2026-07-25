@@ -85,21 +85,21 @@ ZeroAI 是一个功能完整的终端 AI 助手，对标 OpenCode，专为开发
 ### 方式一：pip 安装（推荐）
 
 ```bash
-pip install zero-ai
+pip install zero-ai-cli
 ```
 
 ### 方式二：从源码安装
 
 ```bash
 git clone <仓库地址>
-cd zero-ai
+cd zero-ai-cli
 pip install -e .
 ```
 
 ### 可选：安装语音功能
 
 ```bash
-pip install zero-ai[voice]
+pip install zero-ai-cli[voice]
 ```
 
 语音功能包含：sherpa-onnx（语音识别）、faster-whisper（备用识别）、av（音频处理）。
@@ -111,7 +111,7 @@ pip install zero-ai[voice]
 安装后在任意终端输入：
 
 ```bash
-zero-ai
+zeroai
 ```
 
 ### 首次使用配置
@@ -319,7 +319,7 @@ zero-ai
 
 ```bash
 git clone <仓库地址>
-cd zero-ai
+cd zero-ai-cli
 pip install -e .
 ```
 
@@ -348,7 +348,7 @@ pyinstaller ZeroAI.spec
 ### 项目结构
 
 ```
-zero-ai/
+zero-ai-cli/
 ├── tui_agent.py          # 主程序（单文件架构，含 48 个工具）
 ├── ollama_chat.py        # Ollama 集成
 ├── ollama_agent.py       # Ollama Agent
@@ -371,7 +371,7 @@ A: 按 `Ctrl+P` 打开设置面板，填入智谱 GLM API Key。免费获取：h
 
 ### Q: 语音功能无法使用？
 
-A: 1. 确认已安装语音依赖：`pip install zero-ai[voice]`
+A: 1. 确认已安装语音依赖：`pip install zero-ai-cli[voice]`
    2. 首次使用会自动下载模型（约 220MB）
    3. 确认麦克风权限已开启
 
