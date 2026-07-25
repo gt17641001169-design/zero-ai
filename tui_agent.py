@@ -5695,6 +5695,8 @@ def _ssh_detect_os(conn_id: str = "default") -> str:
     1. 优先用 `ver` 命令（Windows cmd 内建，输出含 "Microsoft Windows"）
     2. 回退用 `echo %OS%`（Windows 输出 "Windows_NT"）
     3. 再回退用 `uname`（Linux 输出内核名，Windows 无此命令）
+
+    注意：本函数通过 _raw_ssh_exec 绕过 ssh_exec 的编码注入，避免递归调用。
     """
     # 如果连接已不存在，清除缓存
     if conn_id not in _SSH_CONNECTIONS:
@@ -5707,9 +5709,35 @@ def _ssh_detect_os(conn_id: str = "default") -> str:
 
     os_type = "linux"  # 默认 Linux
 
+    # 内部执行函数（绕过 ssh_exec 的编码注入，避免递归）
+    def _raw_exec(cmd: str) -> str:
+        """直接调用 asyncssh，不经过 ssh_exec 的编码处理"""
+        conn_info = _SSH_CONNECTIONS.get(conn_id)
+        if not conn_info:
+            return ""
+        conn = conn_info["conn"]
+        if _ssh_is_conn_closed(conn):
+            return ""
+        import asyncio
+        async def _run():
+            try:
+                import asyncssh
+                result = await asyncio.wait_for(
+                    conn.run(cmd, check=False, timeout=8,
+                             encoding='utf-8', errors='replace'),
+                    timeout=13
+                )
+                return result.stdout or ""
+            except Exception:
+                return ""
+        try:
+            return _ssh_run_async(_run)
+        except Exception:
+            return ""
+
     # 探测1：ver 命令（Windows cmd 内建，最可靠）
     try:
-        raw1 = ssh_exec("ver", conn_id=conn_id, timeout=8)
+        raw1 = _raw_exec("ver")
         if raw1 and ("Microsoft" in raw1 or "Windows" in raw1):
             os_type = "windows"
     except Exception:
@@ -5718,7 +5746,7 @@ def _ssh_detect_os(conn_id: str = "default") -> str:
     # 探测2：echo %OS%（Windows 输出 Windows_NT）
     if os_type == "linux":
         try:
-            raw2 = ssh_exec("echo %OS%", conn_id=conn_id, timeout=8)
+            raw2 = _raw_exec("echo %OS%")
             if raw2 and "Windows_NT" in raw2:
                 os_type = "windows"
         except Exception:
@@ -5727,7 +5755,7 @@ def _ssh_detect_os(conn_id: str = "default") -> str:
     # 探测3：uname（Linux 一定有输出，Windows 会报错）
     if os_type == "linux":
         try:
-            raw3 = ssh_exec("uname", conn_id=conn_id, timeout=8)
+            raw3 = _raw_exec("uname")
             # Linux 的 uname 会输出 Linux/Darwin 等；Windows 会报 "不是内部或外部命令"
             if raw3 and ("不是内部或外部命令" in raw3 or "not recognized" in raw3
                          or "无法找到" in raw3):
@@ -5971,6 +5999,28 @@ def ssh_exec(command: str, conn_id: str = "default", timeout: int = 30,
             return f"执行错误: {e}"
 
     try:
+        # Windows 中文乱码修复：自动给 PowerShell/cmd 命令注入 UTF-8 编码
+        # 原因：Windows 中文系统默认 GBK 编码，asyncssh 用 UTF-8 解码会乱码
+        if _ssh_detect_os(conn_id) == "windows":
+            if command.startswith("powershell"):
+                # PowerShell 命令：注入 UTF-8 输出编码设置
+                if '-Command "' in command:
+                    command = command.replace(
+                        '-Command "',
+                        '-Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; ',
+                        1
+                    )
+                elif "-Command '" in command:
+                    command = command.replace(
+                        "-Command '",
+                        "-Command '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; ",
+                        1
+                    )
+            else:
+                # cmd 命令：切换代码页到 65001 (UTF-8)
+                if not command.startswith("chcp"):
+                    command = f"chcp 65001 >nul 2>&1 & {command}"
+
         result = _ssh_run_async(_exec)
         prefix = "" if _internal else _ssh_format_prefix(conn_id) + "\n"
         if isinstance(result, str):
