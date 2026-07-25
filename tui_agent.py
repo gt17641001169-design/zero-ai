@@ -33,6 +33,85 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _USER_HOME = os.path.expanduser("~")
 _ZEROAI_USER_DIR = os.path.join(_USER_HOME, ".zeroai")
 
+# 桌面目录缓存（兼容中英文 Windows / macOS / Linux，首次调用 _get_desktop_dir 时填充）
+_DESKTOP_DIR_CACHE: str = ""
+
+
+def _get_desktop_dir() -> str:
+    """获取桌面目录路径（兼容中英文 Windows / macOS / Linux）。
+
+    优先级：
+    1. Windows: SHGetFolderPathW（CSIDL_DESKTOP，最可靠，能识别"桌面"重定向）
+    2. Windows: USERPROFILE/Desktop 或 USERPROFILE/桌面
+    3. macOS/Linux: ~/Desktop 或 ~/桌面
+    4. Linux: XDG_DESKTOP_DIR 环境变量
+    5. 回退: 用户主目录
+    """
+    global _DESKTOP_DIR_CACHE
+    if _DESKTOP_DIR_CACHE:
+        return _DESKTOP_DIR_CACHE
+
+    # Windows: 用 SHGetFolderPathW 获取真实桌面路径
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            # CSIDL_DESKTOP = 0x00
+            if ctypes.windll.shell32.SHGetFolderPathW(0, 0x00, 0, 0, buf) == 0:
+                if buf.value and os.path.isdir(buf.value):
+                    _DESKTOP_DIR_CACHE = buf.value
+                    return _DESKTOP_DIR_CACHE
+        except Exception:
+            pass
+        # 回退：USERPROFILE 下找 Desktop / 桌面
+        up = os.environ.get("USERPROFILE") or _USER_HOME
+        for name in ("Desktop", "桌面"):
+            p = os.path.join(up, name)
+            if os.path.isdir(p):
+                _DESKTOP_DIR_CACHE = p
+                return _DESKTOP_DIR_CACHE
+
+    # macOS / Linux
+    for name in ("Desktop", "桌面"):
+        p = os.path.join(_USER_HOME, name)
+        if os.path.isdir(p):
+            _DESKTOP_DIR_CACHE = p
+            return _DESKTOP_DIR_CACHE
+
+    # Linux XDG
+    xdg = os.environ.get("XDG_DESKTOP_DIR")
+    if xdg and os.path.isdir(xdg):
+        _DESKTOP_DIR_CACHE = xdg
+        return _DESKTOP_DIR_CACHE
+
+    # 最终回退：用户主目录
+    _DESKTOP_DIR_CACHE = _USER_HOME
+    return _DESKTOP_DIR_CACHE
+
+
+def _resolve_save_path(path: str, default_filename: str) -> str:
+    """解析文档保存路径（默认保存到桌面）。
+
+    规则：
+    - path 为空：保存到 桌面/{default_filename}
+    - path 只含文件名（无目录分隔符）：保存到 桌面/{path}
+    - path 含完整路径：按 path 原样保存
+
+    Args:
+        path: 用户传入的路径
+        default_filename: 默认文件名（如 "未命名.docx"）
+
+    Returns:
+        解析后的绝对路径
+    """
+    if not path:
+        return os.path.join(_get_desktop_dir(), default_filename)
+    # 判断是否只含文件名（无目录部分）
+    if not os.path.dirname(path):
+        return os.path.join(_get_desktop_dir(), path)
+    return path
+
 def _find_resource_dir(subdir: str) -> str:
     """智能查找资源目录（libs/、models/ 等），支持多位置查找。
 
@@ -4038,6 +4117,8 @@ def generate_word(path: str, content: str, title: str = "", template: str = "def
     #/##/### 标题 | -/1. 列表 | > 引用 | ```代码``` | **粗体** *斜体* `代码` ~~删除线~~
     | 表格语法 | ---（分隔线） | [居中]行首标记 [右对齐] | {color:红色}文字{/color}
     """
+    # 默认保存到桌面（path 为空或只含文件名时自动拼到桌面）
+    path = _resolve_save_path(path, "未命名.docx")
     try:
         from docx import Document
         from docx.shared import Pt, Inches, Cm, RGBColor
@@ -4424,6 +4505,8 @@ def generate_excel(path: str, sheets: list, template: str = "default",
             "formula": "=AVERAGE(C2:C4)", # 公式
         }
     """
+    # 默认保存到桌面（path 为空或只含文件名时自动拼到桌面）
+    path = _resolve_save_path(path, "未命名.xlsx")
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -4630,6 +4713,8 @@ def generate_pdf(path: str, content: str, title: str = "", template: str = "defa
     > 引用 / ```代码块``` / **粗体** *斜体*
     ---（分隔线）/ 普通段落 / |表格语法|
     """
+    # 默认保存到桌面（path 为空或只含文件名时自动拼到桌面）
+    path = _resolve_save_path(path, "未命名.pdf")
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.units import cm, mm
@@ -7168,7 +7253,7 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "generate_word", "description": "生成 Word 文档（.docx），支持指定格式模板和高级排版。当用户让你生成Word文档、写报告、合同、简历、论文、学术文章、导出文档时调用。支持8种模板（含academic学术论文模板：双倍行距/摘要/关键词/参考文献自动编号/LaTeX公式渲染）、自定义字体/颜色/页边距/对齐/页眉页脚/表格。",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "保存路径，如 D:/报告.docx"},
+            "path": {"type": "string", "description": "保存路径（可选，默认保存到桌面）。可传完整路径如 D:/报告.docx，或只传文件名如 报告.docx（自动保存到桌面），或留空（自动命名保存到桌面）"},
             "content": {"type": "string", "description": "文档内容（支持 Markdown 标记：# 标题 / - 列表 / > 引用 / ```代码``` / **粗体** *斜体* `代码` ~~删除线~~ / |表格| / [居中]行首对齐 / {color:红色}文字{/color}）"},
             "title": {"type": "string", "description": "文档标题（可选，留空则取内容第一行 # 标题）"},
             "template": {"type": "string", "description": "格式模板：default(默认) / report(正式报告) / contract(合同) / resume(简历) / thesis(论文) / letter(信函) / technical(技术文档) / academic(学术论文：双倍行距+摘要+关键词+参考文献自动编号+LaTeX公式渲染)"},
@@ -7179,12 +7264,12 @@ TOOLS = [
             "align": {"type": "string", "description": "全文对齐：left / center / right / justify"},
             "header": {"type": "string", "description": "页眉文字"},
             "footer": {"type": "string", "description": "页脚文字，支持 {page} 和 {numpages} 占位符"}},
-            "required": ["path", "content"],
+            "required": ["content"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
         "name": "generate_excel", "description": "生成 Excel 文档（.xlsx），支持多工作表、表头样式、隔行变色、自动列宽、图表（柱状图/折线图/饼图）、公式。当用户让你生成Excel表格、数据表、导出Excel、带图表的Excel时调用。",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "保存路径，如 D:/数据表.xlsx"},
+            "path": {"type": "string", "description": "保存路径（可选，默认保存到桌面）。可传完整路径如 D:/数据表.xlsx，或只传文件名如 数据表.xlsx（自动保存到桌面），或留空（自动命名保存到桌面）"},
             "sheets": {"type": "array", "items": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "工作表名（可选，默认Sheet1）"},
                 "data": {"type": "array", "items": {"type": "array"}, "description": "数据二维数组，第一行作为表头"},
@@ -7204,16 +7289,16 @@ TOOLS = [
                 "cell": {"type": "string", "description": "写入单元格，如 D2"},
                 "formula": {"type": "string", "description": "公式，如 =AVERAGE(C2:C4) 或 =SUM(B2:B5)"}
             }, "required": ["sheet", "cell", "formula"]}, "description": "公式列表（可选）"}},
-            "required": ["path", "sheets"],
+            "required": ["sheets"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
         "name": "generate_pdf", "description": "生成 PDF 文档，支持Markdown标记和多种模板。当用户让你生成PDF、导出PDF、写报告PDF、学术论文PDF时调用。支持7种模板（含academic学术论文模板）。",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string", "description": "保存路径，如 D:/报告.pdf"},
+            "path": {"type": "string", "description": "保存路径（可选，默认保存到桌面）。可传完整路径如 D:/报告.pdf，或只传文件名如 报告.pdf（自动保存到桌面），或留空（自动命名保存到桌面）"},
             "content": {"type": "string", "description": "文档内容（支持 Markdown 标记：# 标题 / - 列表 / > 引用 / ```代码``` / **粗体** *斜体* / |表格| / --- 分隔线 / $LaTeX公式$）"},
             "title": {"type": "string", "description": "文档标题（可选）"},
             "template": {"type": "string", "description": "格式模板：default(默认) / report(报告) / contract(合同) / resume(简历) / letter(信函) / technical(技术文档) / academic(学术论文：1.5倍行距+摘要+关键词+参考文献自动编号+LaTeX公式渲染)"}},
-            "required": ["path", "content"],
+            "required": ["content"],
             "additionalProperties": False}}},
     {"type": "function", "function": {
         "name": "render_formula", "description": "渲染 LaTeX 数学公式为终端可显示的 Unicode 文本。当用户写数学公式、物理方程、化学方程式、统计公式、需要学术符号展示时调用。支持希腊字母、上下标、分数、根号、求和、积分、矩阵符号等。",
@@ -7464,9 +7549,9 @@ TOOL_USAGE_RULES = """# 工具使用规则
 ## 项目与文档（6 个）
 - `git_status()`：git 仓库状态
 - `security_audit(path)`：代码安全审计（SQL注入/XSS/敏感信息/依赖漏洞）
-- `generate_word(path, content, template, ...)`：生成 Word 文档（8种模板含academic学术论文+自定义格式）
-- `generate_excel(path, sheets, template)`：生成 Excel 文档（多工作表、表头样式、隔行变色、图表、公式）
-- `generate_pdf(path, content, title, template)`：生成 PDF 文档（7种模板含academic学术论文+LaTeX公式）
+- `generate_word(path, content, template, ...)`：生成 Word 文档（8种模板含academic学术论文+自定义格式）。**path 可选，留空或只传文件名默认保存到桌面**
+- `generate_excel(path, sheets, template)`：生成 Excel 文档（多工作表、表头样式、隔行变色、图表、公式）。**path 可选，留空或只传文件名默认保存到桌面**
+- `generate_pdf(path, content, title, template)`：生成 PDF 文档（7种模板含academic学术论文+LaTeX公式）。**path 可选，留空或只传文件名默认保存到桌面**
 - `open_app(name)`：打开应用/文件（自动搜索本地，无需自定义路径）
 
 ## SSH 远程部署（7 个）
@@ -7504,9 +7589,9 @@ TOOL_USAGE_RULES = """# 工具使用规则
 6. 用户发图片 → `read_image`
 7. 用户说"看屏幕/我屏幕上有什么" → `read_screen`（需先开启伴随模式 Ctrl+W）
 8. 用户问"安全吗/有漏洞吗" → `security_audit`
-9. 用户说"写报告/导出 Word" → `generate_word`
-10. 用户说"Excel/表格/数据表" → `generate_excel`
-11. 用户说"PDF/导出PDF" → `generate_pdf`
+9. 用户说"写报告/导出 Word" → `generate_word`（path 可选，留空默认保存到桌面，无需追问用户路径）
+10. 用户说"Excel/表格/数据表" → `generate_excel`（path 可选，留空默认保存到桌面，无需追问用户路径）
+11. 用户说"PDF/导出PDF" → `generate_pdf`（path 可选，留空默认保存到桌面，无需追问用户路径）
 12. 用户说"打开XX/启动XX/开一下XX" → `open_app`（自动搜索本地，保证能打开任何文件）
 13. 用户写数学/物理/统计公式 → `render_formula`（LaTeX → Unicode 终端显示）
 14. 用户说"论文/学术/研究" → `generate_word` 或 `generate_pdf` 用 `academic` 模板
