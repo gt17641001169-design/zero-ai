@@ -54,8 +54,16 @@ cd /srv/projects/zeroai-proxy
 # 4. 配置 .env
 cp .env.example .env
 nano .env
-#   - 填入 UPSTREAM_API_KEY（智谱真实 Key）
-#   - 修改 CLIENT_TOKENS（生成：python3 -c "import secrets; print(secrets.token_urlsafe(32))"）
+#   - 填入 GLM_API_KEY（智谱真实 Key）
+#   - 填入 OR_API_KEY（OpenRouter 真实 Key，可选）
+#   - 设置 ADMIN_TOKEN（管理端点鉴权，生成：python3 -c "import secrets; print('admin_' + secrets.token_urlsafe(32))"）
+
+# 4.1 配置 tokens.json（推荐模式，含归属/团队/过期/吊销/统计）
+cp tokens.json.example tokens.json
+nano tokens.json
+#   - 替换 "请替换为你的Token_1" 为真实 Token（生成：python3 -c "import secrets; print(secrets.token_urlsafe(32))"）
+#   - 填入 user / team 等归属信息
+#   - 修改后自动热重载，无需重启服务
 
 # 5. 安装 + 启动
 bash start.sh install
@@ -108,12 +116,24 @@ export ZEROAI_PROXY_TOKEN=你的_Token
 
 ## API 端点
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/health` | GET | 健康检查（无需鉴权） |
-| `/v1/chat/completions` | POST | OpenAI 兼容聊天端点 |
-| `/v1/models` | GET | 模型列表 |
-| `/docs` | GET | Swagger 文档 |
+| 端点 | 方法 | 鉴权 | 说明 |
+|------|------|------|------|
+| `/health` | GET | 无 | 健康检查（不上报 Key/Token 详情） |
+| `/` | GET | 无 | 根路径（最小信息） |
+| `/v1/chat/completions` | POST | Client Token | OpenAI 兼容聊天端点（流式 SSE 透传） |
+| `/v1/models` | GET | Client Token | 模型列表（OpenAI 兼容） |
+| `/admin/tokens` | GET | Admin Token | 列出所有 Token（脱敏） |
+| `/admin/tokens/{token}/revoke` | POST | Admin Token | 吊销指定 Token（立即生效） |
+| `/admin/tokens/{token}/reinstate` | POST | Admin Token | 恢复已吊销 Token |
+| `/admin/tokens/{token}/reset-stats` | POST | Admin Token | 重置 Token 用量统计 |
+| `/admin/banned` | GET | Admin Token | 查看当前封禁 IP 列表（脱敏） |
+| `/admin/unban` | POST | Admin Token | 解封指定 IP |
+| `/admin/status` | GET | Admin Token | 服务器状态概览 |
+
+**安全说明（v1.2.0）**：
+- `/docs`、`/redoc`、`/openapi.json` 已关闭，不暴露 API 文档
+- `/admin/*` 端点需 `ADMIN_TOKEN` 鉴权（独立于客户端 Token）
+- 客户端 Token 鉴权使用 `Authorization: Bearer <Token>` 头
 
 ## 测试代理
 

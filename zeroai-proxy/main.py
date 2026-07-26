@@ -208,6 +208,10 @@ class TokenManager:
             old_tokens = self.tokens
             new_tokens = {}
             for token, meta in data.items():
+                # 跳过以 _ 开头的注释键（如 _说明 / _字段说明 / _生成方式）
+                # 这些是 tokens.json.example 中的文档字段，不能作为有效 Token
+                if not isinstance(token, str) or token.startswith("_"):
+                    continue
                 if not isinstance(meta, dict):
                     continue
                 # 保留旧的统计数据

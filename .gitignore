@@ -49,3 +49,7 @@ desktop.ini
 # 备份文件
 *.bak_*
 *.bak
+
+# 临时调试文件
+_tmp_*.py
+_tmp_*/

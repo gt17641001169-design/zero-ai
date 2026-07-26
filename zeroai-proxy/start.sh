@@ -30,9 +30,9 @@ install_app() {
         exit 1
     fi
 
-    # 检查 UPSTREAM_API_KEY
+    # 检查 GLM_API_KEY
     if grep -q "your_glm_api_key_here" "$APP_DIR/.env"; then
-        err ".env 中 UPSTREAM_API_KEY 未修改，请填入真实 Key"
+        err ".env 中 GLM_API_KEY 未修改，请填入真实 Key"
         exit 1
     fi
 
