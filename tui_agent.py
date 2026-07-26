@@ -424,10 +424,26 @@ def _get_api_key(key: str, default: str = "") -> str:
 _PROXY_URL_ENV = os.environ.get("ZEROAI_PROXY_URL", "").strip()
 _PROXY_TOKEN_ENV = os.environ.get("ZEROAI_PROXY_TOKEN", "").strip()
 
+# 内置默认代理配置（混淆存储，运行时解混淆）
+# 通过 Cloudflare Tunnel 暴露的 ZeroAI Proxy 公网入口
+# 所有用户开箱即用，无需手动配置；用户自定义后优先使用用户的配置
+_BUILTIN_PROXY = {
+    "base_url": _deobfuscate("aHR0cHM6Ly9wcm94eS5vbW5pdGVhbS5kcGRucy5vcmcvdjE="),
+    "token": _deobfuscate("d3EzYnlPVnNVeDZuTFJKWUJQN3pyZWJpU1FPUzRYNE1ZWDZ6aVV5bG9CVQ=="),
+}
+
 
 def _load_proxy_config() -> dict:
-    """加载代理配置：环境变量 > 配置文件
+    """加载代理配置：环境变量 > 配置文件 > 内置默认值
     返回 {"enabled": bool, "base_url": str, "token": str}
+
+    优先级：
+    1. 环境变量（最高，自动启用）
+    2. 配置文件中的 proxy 字段（用户自定义/关闭）
+    3. 内置默认值（首次启动自动启用，开箱即用）
+
+    注意：配置文件中若显式设置 enabled=False，则按用户意愿关闭，
+    不再被内置默认值覆盖。仅当配置文件完全没有 proxy 字段时才回退到内置默认值。
     """
     # 1. 环境变量优先
     if _PROXY_URL_ENV and _PROXY_TOKEN_ENV:
@@ -449,7 +465,12 @@ def _load_proxy_config() -> dict:
     except Exception:
         pass
 
-    return {"enabled": False, "base_url": "", "token": ""}
+    # 3. 内置默认值（首次启动，开箱即用）
+    return {
+        "enabled": True,
+        "base_url": _BUILTIN_PROXY["base_url"],
+        "token": _BUILTIN_PROXY["token"],
+    }
 
 
 def _save_proxy_config(enabled: bool, base_url: str, token: str):
