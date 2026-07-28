@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 import sqlite3
 import hashlib
 import threading
@@ -143,18 +145,43 @@ class TfidfVectorizer:
 class EmbeddingBackend:
     """Embedding 后端：优先用 API，回退到 TF-IDF"""
 
-    def __init__(self, model_key: str = "glm", api_key: str = "", base_url: str = ""):
+    def __init__(self, model_key: str = "glm", api_key: str = "", base_url: str = "",
+                 auto_config: bool = False):
         """初始化
 
         Args:
             model_key: 模型标识（glm / openai）
-            api_key: API Key
+            api_key: API Key（为空且 auto_config=True 时自动从项目配置读取）
             base_url: API 地址
+            auto_config: 是否自动从 zeroai.core.constants.MODEL_CONFIGS 读取配置
+                         True 时若 api_key 为空，会尝试从项目配置加载 GLM/OpenRouter Key
+                         并遵循代理配置（PROXY_CONFIG）
         """
         self.model_key = model_key
+        self._tfidf: Optional[TfidfVectorizer] = None
+
+        # 阶段 2.1：自动从项目配置读取 API Key 和代理
+        if auto_config and not api_key:
+            try:
+                from zeroai.core.constants import MODEL_CONFIGS
+                from zeroai.core.secrets import _is_proxy_enabled, PROXY_CONFIG
+                cfg = MODEL_CONFIGS.get(model_key, {})
+                if _is_proxy_enabled():
+                    # 代理模式：用代理 URL 和 Token
+                    proxy_url = PROXY_CONFIG.get("base_url", "")
+                    if proxy_url and not proxy_url.rstrip("/").endswith("/v1"):
+                        proxy_url = proxy_url.rstrip("/") + "/v1"
+                    base_url = proxy_url
+                    api_key = PROXY_CONFIG.get("token", "")
+                else:
+                    # 直连模式：用 MODEL_CONFIGS 中的配置
+                    base_url = cfg.get("base_url", base_url)
+                    api_key = cfg.get("api_key", "")
+            except Exception:
+                pass  # 配置读取失败，回退到 TF-IDF
+
         self.api_key = api_key
         self.base_url = base_url
-        self._tfidf: Optional[TfidfVectorizer] = None
         self._api_available = bool(api_key)
 
     async def embed_texts(self, texts: List[str]) -> np.ndarray:
@@ -178,22 +205,35 @@ class EmbeddingBackend:
 
     @property
     def dim(self) -> int:
-        """向量维度"""
+        """向量维度
+
+        智谱 embedding-3 支持 256/512/1024/2048 维
+        用 1024 维平衡精度和性能
+        """
         if self._api_available:
-            return 1536  # text-embedding-3-small
+            return 1024  # 智谱 embedding-3，1024 维
         return 256  # TF-IDF 降维维度
 
     async def _embed_via_api(self, texts: List[str]) -> np.ndarray:
-        """通过 OpenAI/GLM API 生成 embedding"""
+        """通过 OpenAI/GLM API 生成 embedding
+
+        使用智谱 embedding-3 模型，1024 维
+        """
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(
             base_url=self.base_url or "https://open.bigmodel.cn/api/paas/v4/",
             api_key=self.api_key,
         )
-        # GLM embedding 模型：embedding-3
+        # GLM embedding 模型：embedding-3，支持指定 dimensions
         model = "embedding-3"
-        resp = await client.embeddings.create(model=model, input=texts)
+        try:
+            resp = await client.embeddings.create(
+                model=model, input=texts, dimensions=1024
+            )
+        except TypeError:
+            # 老版本 API 不支持 dimensions 参数，回退
+            resp = await client.embeddings.create(model=model, input=texts)
         vectors = [item.embedding for item in resp.data]
         return np.array(vectors, dtype=np.float32)
 
@@ -265,6 +305,18 @@ class VectorStore:
                     value TEXT
                 )
             """)
+            # 阶段 2.4：记忆衰减所需字段（向后兼容，表已存在时 ALTER 添加）
+            for col, typ, default in [
+                ("access_count", "INTEGER", "0"),
+                ("last_accessed", "REAL", "0"),
+                ("importance", "REAL", "1.0"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE chunks ADD COLUMN {col} {typ} DEFAULT {default}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # 字段已存在
             conn.commit()
             conn.close()
 
@@ -467,6 +519,7 @@ class VectorStore:
 
         with self._lock:
             conn = sqlite3.connect(self.db_path)
+            now = time.time()
             for idx in top_indices:
                 if scores[idx] <= 0:
                     continue
@@ -482,6 +535,12 @@ class VectorStore:
                         "content": row[2],
                         "score": float(scores[idx]),
                     })
+                    # 阶段 2.4：更新访问计数（记忆衰减用）
+                    conn.execute(
+                        "UPDATE chunks SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+                        (now, int(idx)),
+                    )
+            conn.commit()
             conn.close()
 
         return results
@@ -514,6 +573,397 @@ class VectorStore:
             conn.close()
         if os.path.exists(self._vector_path()):
             os.remove(self._vector_path())
+
+    # ========================================================================
+    # 阶段 2.3：BM25 关键词检索 + 混合检索（向量 + BM25 融合）
+    # ========================================================================
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """通用分词（用于 BM25 检索）
+
+        复用 TfidfVectorizer 的分词逻辑：英文按词+下划线拆分，中文按字
+        """
+        tokens = []
+        for word in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text.lower()):
+            tokens.append(word)
+            if "_" in word and len(word) > 3:
+                for part in word.split("_"):
+                    if part and len(part) > 1:
+                        tokens.append(part)
+        for ch in text:
+            if "\u4e00" <= ch <= "\u9fff":
+                tokens.append(ch)
+        return tokens
+
+    def _bm25_search(
+        self,
+        query: str,
+        top_k: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """BM25 关键词检索（零依赖实现）
+
+        BM25 算法：
+            score = Σ IDF(term) * (tf*(k1+1)) / (tf + k1*(1-b+b*|D|/avgdl))
+
+        适用于精确关键词匹配，与向量语义检索互补。
+        常见场景：函数名、类名、变量名等标识符精确匹配。
+        """
+        import math
+
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute("SELECT id, source, content FROM chunks ORDER BY id")
+            rows = cur.fetchall()
+            conn.close()
+
+        if not rows:
+            return []
+
+        query_terms = self._tokenize(query)
+        if not query_terms:
+            return []
+
+        docs = []
+        for row in rows:
+            doc_id, source, content = row
+            terms = self._tokenize(content)
+            docs.append({
+                "id": doc_id, "source": source, "content": content,
+                "terms": terms, "len": len(terms),
+            })
+
+        avgdl = sum(d["len"] for d in docs) / len(docs) if docs else 1
+        k1, b = 1.5, 0.75
+        N = len(docs)
+
+        # IDF
+        df: Dict[str, int] = {}
+        for term in set(query_terms):
+            df[term] = sum(1 for d in docs if term in d["terms"])
+        idf = {
+            term: math.log((N - df_val + 0.5) / (df_val + 0.5) + 1)
+            for term, df_val in df.items()
+        }
+
+        scored = []
+        for d in docs:
+            score = 0.0
+            tf: Dict[str, int] = {}
+            for term in d["terms"]:
+                tf[term] = tf.get(term, 0) + 1
+            for term in query_terms:
+                if term in tf and term in idf:
+                    score += idf[term] * (tf[term] * (k1 + 1)) / (
+                        tf[term] + k1 * (1 - b + b * d["len"] / max(avgdl, 1))
+                    )
+            if score > 0:
+                scored.append({**d, "score": score})
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return [
+            {"doc_id": s["id"], "source": s["source"],
+             "content": s["content"], "score": float(s["score"])}
+            for s in scored[:top_k]
+        ]
+
+    def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        vector_weight: float = 0.7,
+        bm25_weight: float = 0.3,
+    ) -> List[Dict[str, Any]]:
+        """混合检索：向量语义检索 + BM25 关键词检索 融合
+
+        策略：
+        1. 分别用向量检索和 BM25 检索，各取 top_k*2
+        2. 分数归一化（min-max 到 [0,1]）
+        3. 加权融合：final_score = vector_weight * vec_score + bm25_weight * bm25_score
+        4. 按融合分数排序，取 top_k
+
+        Args:
+            query: 查询文本
+            top_k: 返回数量
+            vector_weight: 向量检索权重（0-1）
+            bm25_weight: BM25 权重（0-1）
+
+        Returns:
+            [{"doc_id":..., "source":..., "content":..., "score":...,
+              "vec_score":..., "bm25_score":...}, ...]
+        """
+        # 各取更多候选，确保融合后有足够 top_k
+        candidate_k = max(top_k * 2, 10)
+        vec_results = self.search(query, top_k=candidate_k)
+        bm25_results = self._bm25_search(query, top_k=candidate_k)
+
+        # 归一化函数
+        def _normalize(results: List[Dict[str, Any]], score_key: str) -> Dict[int, float]:
+            if not results:
+                return {}
+            scores = [r[score_key] for r in results]
+            min_s, max_s = min(scores), max(scores)
+            denom = max_s - min_s if max_s > min_s else 1.0
+            return {r["doc_id"]: (r[score_key] - min_s) / denom for r in results}
+
+        vec_norm = _normalize(vec_results, "score")
+        bm25_norm = _normalize(bm25_results, "score")
+
+        # 收集所有候选 doc_id
+        all_ids = set(vec_norm.keys()) | set(bm25_norm.keys())
+
+        # 从数据库批量查内容（避免 N+1 查询）
+        content_map: Dict[int, Dict[str, Any]] = {}
+        if all_ids:
+            with self._lock:
+                conn = sqlite3.connect(self.db_path)
+                placeholders = ",".join("?" * len(all_ids))
+                cur = conn.execute(
+                    f"SELECT id, doc_id, source, content FROM chunks WHERE id IN ({placeholders})",
+                    tuple(all_ids),
+                )
+                for row in cur.fetchall():
+                    content_map[row[0]] = {
+                        "doc_id": row[1], "source": row[2], "content": row[3],
+                    }
+                conn.close()
+
+        # 融合打分
+        fused = []
+        for doc_id in all_ids:
+            if doc_id not in content_map:
+                continue
+            vec_s = vec_norm.get(doc_id, 0.0)
+            bm25_s = bm25_norm.get(doc_id, 0.0)
+            final = vector_weight * vec_s + bm25_weight * bm25_s
+            entry = dict(content_map[doc_id])
+            entry["score"] = float(final)
+            entry["vec_score"] = float(vec_s)
+            entry["bm25_score"] = float(bm25_s)
+            fused.append(entry)
+
+        fused.sort(key=lambda x: x["score"], reverse=True)
+        return fused[:top_k]
+
+    async def search_async(
+        self,
+        query: str,
+        top_k: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """异步检索：用 API embedding 生成查询向量（如果可用）
+
+        与同步 search() 的区别：
+        - search()：用 TF-IDF 生成查询向量（同步，零依赖）
+        - search_async()：用 API embedding 生成查询向量（异步，精度更高）
+
+        如果 API 不可用，回退到同步 search()
+        """
+        if not self.embedding._api_available:
+            return self.search(query, top_k)
+
+        # 用 API 生成查询向量
+        try:
+            query_vecs = await self.embedding.embed_texts([query])
+            if query_vecs.shape[0] == 0:
+                return self.search(query, top_k)
+            query_vec = query_vecs[0]
+        except Exception:
+            return self.search(query, top_k)
+
+        vectors = self._load_vectors()
+        if vectors.shape[0] == 0 or vectors.shape[1] != query_vec.shape[0]:
+            # 维度不匹配（可能 embedding 后端切换），回退
+            return self.search(query, top_k)
+
+        # 余弦相似度
+        query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+        vec_norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-8
+        normalized = vectors / vec_norms
+        scores = normalized @ query_norm
+
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        results = []
+
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            now = time.time()
+            for idx in top_indices:
+                if scores[idx] <= 0:
+                    continue
+                cur = conn.execute(
+                    "SELECT doc_id, source, content FROM chunks WHERE id=?",
+                    (int(idx),),
+                )
+                row = cur.fetchone()
+                if row:
+                    results.append({
+                        "doc_id": row[0],
+                        "source": row[1],
+                        "content": row[2],
+                        "score": float(scores[idx]),
+                    })
+                    conn.execute(
+                        "UPDATE chunks SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+                        (now, int(idx)),
+                    )
+            conn.commit()
+            conn.close()
+
+        return results
+
+    # ========================================================================
+    # 阶段 2.4：记忆衰减策略（时间 + 访问频率衰减）
+    # ========================================================================
+
+    def apply_decay(
+        self,
+        time_decay_days: float = 30.0,
+        frequency_boost: float = 0.1,
+        min_importance: float = 0.1,
+    ) -> int:
+        """应用记忆衰减：降低旧且少用的记忆重要性
+
+        衰减公式：
+            importance = max(min_importance,
+                             1.0 - days_since_access / time_decay_days
+                                   + access_count * frequency_boost)
+
+        重要性低于阈值的记忆会被标记（但不删除，可手动清理）
+
+        Args:
+            time_decay_days: 时间衰减周期（天），超过此周期未访问的记忆重要性降到最低
+            frequency_boost: 每次访问的重要性加成
+            min_importance: 最低重要性阈值
+
+        Returns:
+            被衰减的记忆数量（importance 下降的记忆数）
+        """
+        import math as _math
+
+        now = time.time()
+        decay_seconds = time_decay_days * 86400
+        decayed_count = 0
+
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute(
+                "SELECT id, access_count, last_accessed, importance FROM chunks"
+            )
+            rows = cur.fetchall()
+
+            for row in rows:
+                chunk_id, access_count, last_accessed, old_imp = row
+                # 时间衰减：距上次访问的时间
+                if last_accessed > 0:
+                    days_since = (now - last_accessed) / 86400
+                    time_factor = max(0.0, 1.0 - days_since / time_decay_days)
+                else:
+                    # 从未访问过的，按创建时间衰减（用 chunk_id 近似）
+                    time_factor = 0.5
+
+                # 频率加成
+                freq_factor = min(access_count * frequency_boost, 0.5)
+
+                new_imp = max(min_importance, time_factor + freq_factor)
+
+                if new_imp < (old_imp if old_imp else 1.0):
+                    conn.execute(
+                        "UPDATE chunks SET importance = ? WHERE id = ?",
+                        (new_imp, chunk_id),
+                    )
+                    decayed_count += 1
+
+            conn.commit()
+            conn.close()
+
+        return decayed_count
+
+    def prune_low_importance(
+        self,
+        threshold: float = 0.15,
+        max_to_prune: int = 100,
+    ) -> int:
+        """清理重要性低于阈值的记忆（慎用，会删除数据）
+
+        Args:
+            threshold: 重要性阈值，低于此值的记忆将被删除
+            max_to_prune: 最多清理数量（避免一次清理太多）
+
+        Returns:
+            实际清理的数量
+        """
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute(
+                "SELECT id FROM chunks WHERE importance < ? ORDER BY importance ASC LIMIT ?",
+                (threshold, max_to_prune),
+            )
+            ids_to_delete = [row[0] for row in cur.fetchall()]
+            if ids_to_delete:
+                placeholders = ",".join("?" * len(ids_to_delete))
+                conn.execute(
+                    f"DELETE FROM chunks WHERE id IN ({placeholders})",
+                    tuple(ids_to_delete),
+                )
+                conn.commit()
+            conn.close()
+
+        if ids_to_delete:
+            # 重建向量矩阵
+            try:
+                asyncio.get_event_loop().create_task(self._rebuild_vectors())
+            except RuntimeError:
+                # 没有事件循环，同步重建
+                pass
+
+        return len(ids_to_delete)
+
+    def get_stats_enhanced(self) -> Dict[str, Any]:
+        """获取增强统计信息（含访问统计和重要性分布）"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute("SELECT COUNT(*), COUNT(DISTINCT source) FROM chunks")
+            total, sources = cur.fetchone()
+            cur = conn.execute("SELECT source, COUNT(*) FROM chunks GROUP BY source")
+            by_source = {row[0]: row[1] for row in cur.fetchall()}
+
+            # 访问统计
+            cur = conn.execute(
+                "SELECT COUNT(*), AVG(access_count), MAX(access_count), AVG(importance) FROM chunks"
+            )
+            stat_row = cur.fetchone()
+            access_stats = {
+                "avg_access_count": float(stat_row[1] or 0),
+                "max_access_count": int(stat_row[2] or 0),
+                "avg_importance": float(stat_row[3] or 1.0),
+            }
+
+            # 重要性分布
+            cur = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN importance >= 0.7 THEN 1 ELSE 0 END) as high, "
+                "SUM(CASE WHEN importance >= 0.3 AND importance < 0.7 THEN 1 ELSE 0 END) as mid, "
+                "SUM(CASE WHEN importance < 0.3 THEN 1 ELSE 0 END) as low "
+                "FROM chunks"
+            )
+            dist_row = cur.fetchone()
+            importance_dist = {
+                "high (>=0.7)": int(dist_row[0] or 0),
+                "mid (0.3-0.7)": int(dist_row[1] or 0),
+                "low (<0.3)": int(dist_row[2] or 0),
+            }
+            conn.close()
+
+        vectors = self._load_vectors()
+        return {
+            "total_chunks": total,
+            "total_sources": sources,
+            "by_source": by_source,
+            "vector_dim": vectors.shape[1] if vectors.size else 0,
+            "vector_count": vectors.shape[0],
+            "access_stats": access_stats,
+            "importance_dist": importance_dist,
+        }
 
 
 # ============================================================================

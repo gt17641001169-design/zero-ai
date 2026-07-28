@@ -161,6 +161,18 @@ from .agent import (
     PLANNER_SYSTEM_PROMPT,
     get_agent_loop,
     reset_agent_loop,
+    # 阶段 1 增强：思维链 / 多步规划 / 反思 / 并行 / 摘要
+    Thought,
+    Plan,
+    ReflexionEngine,
+    ToolResultSummarizer,
+    PlanAndExecutePlanner,
+    AdvancedAgentLoop,
+    REFLECTION_SYSTEM_PROMPT,
+    SUMMARIZER_SYSTEM_PROMPT,
+    PLANNER_PLAN_SYSTEM_PROMPT,
+    get_advanced_agent_loop,
+    reset_advanced_agent_loop,
 )
 
 __all__ = [
@@ -214,4 +226,11 @@ __all__ = [
     # ReAct Agent
     "ReActPlanner", "AgentLoop", "PLANNER_SYSTEM_PROMPT",
     "get_agent_loop", "reset_agent_loop",
+    # 阶段 1 增强
+    "Thought", "Plan",
+    "ReflexionEngine", "ToolResultSummarizer", "PlanAndExecutePlanner",
+    "AdvancedAgentLoop",
+    "REFLECTION_SYSTEM_PROMPT", "SUMMARIZER_SYSTEM_PROMPT",
+    "PLANNER_PLAN_SYSTEM_PROMPT",
+    "get_advanced_agent_loop", "reset_advanced_agent_loop",
 ]

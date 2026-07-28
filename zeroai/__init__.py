@@ -1,4 +1,13 @@
-"""ZeroAI - Terminal AI Assistant for Research & Engineering"""
+"""ZeroAI - Terminal AI Assistant for Research & Engineering
+
+模块清单：
+- core：核心引擎（LLM 客户端、专家路由、上下文管理、Agent Loop）
+- tools：工具函数集（文件/命令/网络/文档/安全/SSH/语音等）
+- memory：向量记忆/RAG（语义检索、对话记忆、文件监视）
+- mcp：Model Context Protocol（Client/Server 双向支持）
+- tui：终端 UI（基于 rich/components）
+- utils：通用工具
+"""
 import sys
 from pathlib import Path
 
@@ -21,6 +30,10 @@ from .core.context import (
 )
 from .tools.base import Tool, ToolRegistry, ToolError, ToolExecutionError, ToolValidationError
 from .utils.platform import is_windows, is_linux, is_macos, get_platform
+
+# MCP 模块（阶段 3：Model Context Protocol 支持）
+# 延迟导入：仅在访问时初始化，避免启动时连接 MCP 服务器
+from . import mcp
 
 
 __version__ = "1.1.3"
