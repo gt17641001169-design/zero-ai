@@ -83,7 +83,20 @@ def color_str_to_id(color_str: Optional[str]) -> int:
 # ============================================================================
 
 def _find_zig_lib() -> Optional[str]:
-    """查找 zig_render 共享库路径"""
+    """查找 zig_render 共享库路径
+
+    搜索顺序（严谨的多层降级）：
+        0. 环境变量 ZEROAI_ZIG_LIB（开发者强制指定）
+        1. 包内（zeroai_tui/）—— build.zig 安装目标
+        2. 项目根 zeroai-tui/
+        3. src/ 目录（开发期 zig build 输出）
+        4. zig-out/bin、zig-out/lib（Zig 标准构建输出）
+        5. Python sys.prefix/Lib/site-packages（pip 安装位置）
+        6. 系统库目录（PATH / LD_LIBRARY_PATH / DYLD_LIBRARY_PATH）
+
+    Returns:
+        库文件完整路径，未找到返回 None
+    """
     # 库文件名（按平台）
     if sys.platform == "win32":
         lib_names = ["zig_render.dll", "libzig_render.dll"]
@@ -92,33 +105,193 @@ def _find_zig_lib() -> Optional[str]:
     else:
         lib_names = ["libzig_render.so", "zig_render.so"]
 
-    # 搜索路径顺序：
-    # 1. 包内（zeroai_tui/）—— build.zig 安装目标
-    # 2. 项目根 zeroai-tui/
-    # 3. src/ 目录（开发期 zig build 输出）
+    # 0. 环境变量强制指定（开发者优先级最高）
+    env_path = os.environ.get("ZEROAI_ZIG_LIB")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+
+    # 1-4. 包内 / 项目根 / src / zig-out
     package_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(package_dir)
     src_dir = os.path.join(project_root, "src")
+    zig_out_bin = os.path.join(project_root, "zig-out", "bin")
+    zig_out_lib = os.path.join(project_root, "zig-out", "lib")
 
-    search_dirs = [package_dir, project_root, src_dir]
+    search_dirs = [
+        package_dir,        # build.zig 安装目标
+        project_root,       # 开发期手动编译
+        src_dir,            # src/ 输出
+        zig_out_bin,        # zig build 默认输出
+        zig_out_lib,
+    ]
 
     for d in search_dirs:
+        if not d or not os.path.isdir(d):
+            continue
         for name in lib_names:
             path = os.path.join(d, name)
             if os.path.isfile(path):
                 return path
+
+    # 5. Python 安装位置（pip install 后产物位置）
+    py_search_dirs = [
+        sys.prefix,
+        os.path.join(sys.prefix, "Lib"),
+        os.path.join(sys.prefix, "lib"),
+    ]
+    # 虚拟环境场景
+    if hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix:
+        py_search_dirs.extend([
+            sys.base_prefix,
+            os.path.join(sys.base_prefix, "Lib"),
+        ])
+    # site-packages
+    try:
+        import site
+        for sp in site.getsitepackages():
+            py_search_dirs.append(sp)
+        py_search_dirs.append(site.getusersitepackages())
+    except Exception:
+        pass
+
+    for d in py_search_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for name in lib_names:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                return path
+
+    # 6. 系统库目录
+    if sys.platform == "win32":
+        # Windows: 搜索 PATH 中的目录
+        path_env = os.environ.get("PATH", "")
+        for d in path_env.split(os.pathsep):
+            if not d or not os.path.isdir(d):
+                continue
+            for name in lib_names:
+                path = os.path.join(d, name)
+                if os.path.isfile(path):
+                    return path
+    else:
+        # Unix: LD_LIBRARY_PATH / DYLD_LIBRARY_PATH
+        for env_var in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+            lib_path = os.environ.get(env_var, "")
+            for d in lib_path.split(os.pathsep):
+                if not d or not os.path.isdir(d):
+                    continue
+                for name in lib_names:
+                    path = os.path.join(d, name)
+                    if os.path.isfile(path):
+                        return path
+        # 标准系统库目录
+        for d in ("/usr/lib", "/usr/local/lib", "/opt/local/lib", "/lib"):
+            if not os.path.isdir(d):
+                continue
+            for name in lib_names:
+                path = os.path.join(d, name)
+                if os.path.isfile(path):
+                    return path
+
     return None
 
 
+def _diagnose_zig_load_failure() -> str:
+    """诊断 Zig 加载失败原因（用于自检和调试）
+
+    Returns:
+        诊断信息字符串
+    """
+    lib_path = _find_zig_lib()
+
+    # 库找到且加载成功的情况
+    if lib_path is not None and _zig_load_error is None:
+        return f"Zig 库加载成功: {lib_path}"
+
+    # 库找到但加载失败
+    if lib_path is not None and _zig_load_error is not None:
+        reasons = []
+        reasons.append(f"Zig 库已找到但加载失败: {lib_path}")
+        reasons.append(f"失败原因: {_zig_load_error}")
+        reasons.append("")
+        reasons.append("可能原因与修复：")
+        reasons.append("  1. ABI 不兼容：重新 zig build 并替换共享库")
+        reasons.append("  2. 依赖缺失：检查 Zig 运行时依赖（Linux 用 ldd，Windows 用 dumpbin）")
+        reasons.append("  3. 权限问题：检查文件读写权限")
+        reasons.append("  4. 32/64 位不匹配：确认 Python 与 Zig 都是同一架构")
+        reasons.append("")
+        reasons.append("当前会自动降级到 C 扩展或纯 Python 实现，不影响功能")
+        return "\n".join(reasons)
+
+    # 库未找到
+    reasons = []
+    reasons.append("未找到 zig_render 共享库，已搜索以下位置：")
+
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(package_dir)
+
+    searched = [
+        ("ZEROAI_ZIG_LIB 环境变量", os.environ.get("ZEROAI_ZIG_LIB", "(未设置)")),
+        ("包内目录", package_dir),
+        ("项目根", project_root),
+        ("src/", os.path.join(project_root, "src")),
+        ("zig-out/bin", os.path.join(project_root, "zig-out", "bin")),
+        ("zig-out/lib", os.path.join(project_root, "zig-out", "lib")),
+        ("sys.prefix", sys.prefix),
+        ("site-packages", "(多个)"),
+    ]
+
+    if sys.platform != "win32":
+        for env_var in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+            searched.append((env_var, os.environ.get(env_var, "(未设置)")))
+        searched.append(("/usr/lib", "/usr/local/lib"))
+
+    for label, path in searched:
+        reasons.append(f"  - {label}: {path}")
+
+    reasons.append("")
+    reasons.append("修复方法：")
+    reasons.append("  1. 在 zeroai-tui/ 目录运行 'zig build -Doptimize=ReleaseFast'")
+    reasons.append("  2. 或设置环境变量 ZEROAI_ZIG_LIB 指向 zig_render.dll 路径")
+    reasons.append("  3. 当前会自动降级到 C 扩展或纯 Python 实现，不影响功能")
+
+    return "\n".join(reasons)
+
+
 def _load_zig_lib():
-    """加载 zig_render 共享库，失败返回 None"""
+    """加载 zig_render 共享库，失败返回 None
+
+    失败原因会记录到 _zig_load_error 全局变量，用于自检诊断。
+    """
+    global _zig_load_error
     lib_path = _find_zig_lib()
     if lib_path is None:
+        _zig_load_error = "library not found"
         return None
 
     try:
-        lib = ctypes.CDLL(lib_path)
-    except OSError:
+        # Windows: 使用 LOAD_WITH_ALTERED_SEARCH_PATH 让依赖 DLL 也能加载
+        if sys.platform == "win32":
+            lib = ctypes.CDLL(lib_path, mode=0x8)
+        else:
+            lib = ctypes.CDLL(lib_path)
+    except OSError as e:
+        _zig_load_error = f"CDLL load failed: {e}"
+        return None
+
+    # 验证 zig_diff_buffers 符号存在
+    try:
+        func = getattr(lib, "zig_diff_buffers", None)
+        if func is None:
+            _zig_load_error = f"symbol 'zig_diff_buffers' not found in {lib_path}"
+            try:
+                DYNLIB_CLOSE = getattr(lib, "_handle", None)
+                # ctypes 句柄在 GC 时会自动关闭，无需手动 close
+            except Exception:
+                pass
+            return None
+    except Exception as e:
+        _zig_load_error = f"symbol lookup failed: {e}"
         return None
 
     # 配置 zig_diff_buffers 函数签名
@@ -128,20 +301,29 @@ def _load_zig_lib():
     #     usize, usize,
     #     [*]u8, usize, *usize
     # )
-    lib.zig_diff_buffers.argtypes = [
-        ctypes.c_char_p,                          # current_chars
-        ctypes.POINTER(StyleStruct),              # current_styles
-        ctypes.c_char_p,                          # next_chars
-        ctypes.POINTER(StyleStruct),              # next_styles
-        ctypes.c_size_t,                          # rows
-        ctypes.c_size_t,                          # cols
-        ctypes.c_char_p,                          # output
-        ctypes.c_size_t,                          # output_capacity
-        ctypes.POINTER(ctypes.c_size_t),          # output_len
-    ]
-    lib.zig_diff_buffers.restype = ctypes.c_int
+    try:
+        lib.zig_diff_buffers.argtypes = [
+            ctypes.c_char_p,                          # current_chars
+            ctypes.POINTER(StyleStruct),              # current_styles
+            ctypes.c_char_p,                          # next_chars
+            ctypes.POINTER(StyleStruct),              # next_styles
+            ctypes.c_size_t,                          # rows
+            ctypes.c_size_t,                          # cols
+            ctypes.c_char_p,                          # output
+            ctypes.c_size_t,                          # output_capacity
+            ctypes.POINTER(ctypes.c_size_t),          # output_len
+        ]
+        lib.zig_diff_buffers.restype = ctypes.c_int
+    except Exception as e:
+        _zig_load_error = f"signature config failed: {e}"
+        return None
 
+    _zig_load_error = None
     return lib
+
+
+# 加载状态记录（用于诊断）
+_zig_load_error: Optional[str] = None
 
 
 # 尝试加载
@@ -317,3 +499,5 @@ if __name__ == "__main__":
         print(f"Self-test: {'PASS' if self_test() else 'FAIL'}")
     else:
         print("Zig library not found. Run 'zig build' in zeroai-tui/ first.")
+        print()
+        print(_diagnose_zig_load_failure())

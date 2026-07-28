@@ -9094,6 +9094,14 @@ try:
     # ---- tools 层：TOOLS schema 和 TOOL_MAP（覆盖本地定义） ----
     from zeroai.tools.registry import TOOLS, TOOL_MAP
 
+    # ---- core 层：工具调用 XML 解析器（阶段 D.4 抽取） ----
+    # 名称映射：tui_agent 内部使用 _ 前缀（私有），zeroai.core.tool_call_parser 使用公开名
+    from zeroai.core.tool_call_parser import (
+        parse_tool_call_xml as _parse_tool_call_xml,
+        split_csv_args as _split_csv_args,
+        needs_tool_calls as _needs_tool_calls,
+    )
+
     _ZEROAI_IMPL_ACTIVE = True  # 标记 zeroai 实现已激活
 except ImportError as _e:
     # zeroai 包不可用或损坏，回退到本地实现

@@ -212,6 +212,51 @@ ZeroAI 是一个面向科研工作者与开发者的终端 AI 协作平台。系
 - 配置审计：检查配置文件安全问题
 - 非侵入式：仅扫描自身项目，不进行渗透测试
 
+### ReAct Agent Loop（推理-行动循环）
+
+阶段 1 引入的 Agent 框架，超越传统的单次工具调用：
+
+- **思维链可视化**：展示 Thought → Action → Observation → Thought 全过程
+- **Plan-and-Execute 规划**：复杂任务自动分解为多步计划，逐步执行
+- **Reflexion 自反思**：工具调用失败时自动分析原因并调整策略
+- **并行工具调用**：独立子任务可并行执行，提升效率
+- **工具结果摘要**：长输出自动压缩，避免上下文溢出
+- **TUI 命令**：`/react` 进入 Agent 模式，`/索引` 构建项目索引，`/记忆` 查看向量记忆
+
+### 向量记忆与 RAG（检索增强生成）
+
+阶段 2 引入的长期记忆系统，支持基于语义的上下文召回：
+
+- **GLM embedding-3 集成**：使用智谱 GLM embedding-3 模型生成向量
+- **混合检索**：向量相似度（0.7 权重）+ BM25 关键词（0.3 权重）融合排序
+- **对话历史向量化**：自动将历史对话分块、向量化、入库
+- **记忆衰减**：长期未访问的记忆自动降权，避免噪声干扰
+- **文件背景监视**：项目文件变更时自动重新索引，保持记忆新鲜度
+- **零依赖回退**：无 embedding API 时自动降级为纯 TF-IDF 检索
+
+### MCP 协议支持（Model Context Protocol）
+
+阶段 3 引入的 MCP 双向支持，使 ZeroAI 可作为 MCP Server 暴露工具给外部客户端，也可作为 Client 接入外部 MCP 服务器：
+
+- **JSON-RPC 2.0 核心**：完整实现 MCP 协议规范
+- **stdio / SSE 双传输**：支持本地子进程（stdio）和远程服务（SSE）两种传输方式
+- **自动工具注册**：接入外部 MCP Server 后，其工具自动注册到 ZeroAI 工具表
+- **58 个工具暴露**：作为 MCP Server 时，将全部 58 个内置工具暴露给 Claude Desktop 等客户端
+- **Claude Desktop 配置示例**：`zeroai/mcp/examples/claude_desktop_config.json` 提供即用配置
+- **启动方式**：`python -m zeroai.mcp` 启动 MCP Server
+
+### C/Zig 加速层（高性能终端渲染）
+
+阶段 D 引入的混合语言加速层，为 TUI 渲染提供性能保障：
+
+- **三层降级**：Zig 共享库 → C 扩展 → 纯 Python，自动选择最快可用路径
+- **跨平台构建**：`scripts/build_extensions.py` 支持 Windows / macOS / Linux
+- **ABI 一致性**：`StyleStruct` 8 字节结构在 C/Zig/Python 三端布局完全一致
+- **ctypes 加载**：Zig 库通过 ctypes 加载，无需编译 Python 扩展即可使用
+- **多层路径搜索**：环境变量 → 包内 → 项目根 → zig-out → site-packages → 系统库
+- **诊断函数**：`_diagnose_zig_load_failure()` 提供详细的加载失败原因分析
+- **ABI 测试套件**：`tests/test_abi.py` 验证字段偏移、颜色映射、大缓冲区 stress 测试
+
 ---
 
 ## 安装

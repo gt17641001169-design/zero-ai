@@ -19,18 +19,28 @@
 - **LICENSE**：新增专有软件许可证
 - **AUTHORS**：新增作者列表
 - **CHANGELOG.md**：新增更新日志（本文件）
+- **ReAct Agent Loop**（阶段 1）：思维链可视化、Plan-and-Execute 规划、Reflexion 自反思、并行工具调用、工具结果摘要
+- **向量记忆与 RAG**（阶段 2）：GLM embedding-3 集成、混合检索（向量+BM25）、对话历史向量化、记忆衰减、文件背景监视
+- **MCP 协议支持**（阶段 3）：JSON-RPC 2.0、stdio/SSE 双传输、自动工具注册、58 工具暴露、Claude Desktop 配置示例
+- **C/Zig 加速层**（阶段 D）：三层降级（Zig→C→Python）、跨平台构建脚本、ABI 一致性测试、ctypes 加载、多层路径搜索、诊断函数
+- **工具调用解析器**：`zeroai/core/tool_call_parser.py` 从 tui_agent.py 抽取 `_parse_tool_call_xml`、`_split_csv_args`、`needs_tool_calls`，独立可测试
+- **Markdown 聚合模块**：`zeroai/tui/markdown.py` 聚合 6 个渲染函数（render_markdown/_safe_markdown/_normalize_markdown_for_academic/render_latex_in_text/_latex_to_unicode/render_image_preview）
+- **MCP Claude Desktop 配置**：`zeroai/mcp/examples/claude_desktop_config.json` 提供即用配置
+- **跨平台构建脚本**：`zeroai-tui/scripts/build_extensions.py` 支持 Windows/macOS/Linux
 
 ### 变更
 - **入口点**：`pyproject.toml` 的 `project.scripts.zeroai` 由 `tui_agent:main` 改为 `zeroai.main:main`
 - **包发现**：`pyproject.toml` 的 `packages.find` 包含 `zeroai*` 全部子包
 - **版本号**：1.1.2 → 1.1.3
 - **`.gitignore`**：新增 `zeroai-tui/.zig-cache/`、`zeroai-tui/zig-out/`、Zig 共享库与 C 扩展产物的排除规则
+- **tui_agent.py 切换块扩展**：新增 `tool_call_parser` 切换块，将 `_parse_tool_call_xml`、`_split_csv_args`、`_needs_tool_calls` 切换到 `zeroai.core.tool_call_parser` 实现
 
 ### 内部调用切换
 - **core 层切换**：`tui_agent.py` 通过"切换块"（`_ZEROAI_IMPL_ACTIVE`）将 38+ 个 core 层符号
   的实际调用切换到 `zeroai.core.*` 实现，原函数定义保留作为备份
 - **tools 层切换**：56 个工具函数的实际调用切换到 `zeroai.tools.*` 实现
 - **TOOLS/TOOL_MAP 切换**：`tui_agent.TOOLS` 与 `TOOL_MAP` 指向 `zeroai.tools.registry` 的同一对象
+- **tool_call_parser 切换**（阶段 D.4）：`_parse_tool_call_xml` / `_split_csv_args` / `_needs_tool_calls` 切换到 `zeroai.core.tool_call_parser` 实现
 - **回退机制**：导入失败时自动回退到 `tui_agent.py` 本地实现，`_ZEROAI_IMPL_ACTIVE=False`
 
 ### 安全
@@ -43,7 +53,28 @@
 ### 测试
 - 新增 `test_phase3_regression.py`：阶段3 切换块的 8 项回归测试
 - 新增 `test_v1_1_3_release.py`：v1.1.3 发布的 10 项集成测试
-- zeroai-tui 测试套件：30 项测试全部通过
+- 新增 `test_mcp_integration.py`：MCP 端到端 8 项测试（C.1-C.4 全覆盖）
+- 新增 `test_react_agent.py`：ReAct Agent + 向量记忆 11 项测试
+- 新增 `test_tool_call_xml.py`：工具调用 XML 解析 4 项测试
+- 新增 `test_tools_verification.py`：58 个工具可调用性 + 签名匹配验证
+- 新增 `test_markdown_module.py`：Markdown 聚合模块 10 项测试
+- zeroai-tui 测试套件：ABI 一致性 10 项测试全部通过
+
+### 阶段 CDE 深入完成（2026-07-28）
+- **阶段 C（MCP 接入验证）**：
+  - C.1 预设依赖检测、C.2 Claude Desktop 配置、C.3 端到端 MCP Server、C.4 工具完整性
+  - 8/8 测试通过，ZeroAI MCP Server 可被 Claude Desktop 等外部客户端调用
+- **阶段 D（工程化与 C/Zig 加速层）**：
+  - D.1 工具去重：file_ops.py 类版工具委托到 file_manager.py 函数版实现
+  - D.2 voice 工具注册：speak_tts / listen_asr 注册到 TOOL_MAP（工具数 56→58）
+  - D.3 死代码清理：system_check.py 移除 14 行死代码（已备份）
+  - D.4 tui_agent.py 模块化拆分：tool_call_parser.py 抽取、markdown.py 聚合完善
+  - Zig 库构建成功：`zeroai_tui/zig_render.dll`（HAS_ZIG_RENDERER=True）
+  - ABI 一致性验证：StyleStruct 8 字节、字段偏移量、颜色映射、大缓冲区 stress
+- **阶段 E（工程化与发布）**：
+  - 版本号一致性：pyproject.toml / zeroai/__init__.py / README.md badge 全部 1.1.3
+  - README.md 新增 4 个章节：ReAct Agent Loop、向量记忆与 RAG、MCP 协议支持、C/Zig 加速层
+  - CHANGELOG.md 完整记录阶段 1-3 与 CDE 深入完成工作
 
 ---
 

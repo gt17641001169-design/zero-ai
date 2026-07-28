@@ -1,0 +1,36 @@
+{
+  "_comment": "Claude Desktop MCP 配置示例 - 将 ZeroAI 作为 MCP 服务器接入 Claude Desktop",
+  "_doc": "将本文件内容合并到 Claude Desktop 的配置文件中即可使用 ZeroAI 的 58 个工具",
+  "_config_locations": {
+    "macOS": "~/Library/Application Support/Claude/claude_desktop_config.json",
+    "Windows": "%APPDATA%\\Claude\\claude_desktop_config.json",
+    "Linux": "~/.config/Claude/claude_desktop_config.json"
+  },
+  "_usage": "1. 复制 mcpServers 内容到 Claude Desktop 配置文件; 2. 重启 Claude Desktop; 3. 在对话中即可使用 ZeroAI 工具",
+  "mcpServers": {
+    "zeroai": {
+      "command": "python",
+      "args": ["-m", "zeroai.mcp"],
+      "transport": "stdio",
+      "_description": "ZeroAI 主服务 - 暴露 58 个内置工具（文件/命令/SSH/学术/文档生成/安全审计等）"
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "transport": "stdio",
+      "_description": "官方文件系统 MCP（需先安装 Node.js）"
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "transport": "stdio",
+      "_description": "官方网页抓取 MCP（需先安装 uv: pip install uv）"
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "transport": "stdio",
+      "_description": "官方顺序思考 MCP - 动态思维链工具"
+    }
+  }
+}
