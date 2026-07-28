@@ -1054,6 +1054,127 @@ def route_expert(user_input: str) -> str:
     return "knowledge"
 
 
+def _needs_tool_calls(user_input: str) -> bool:
+    """判断用户请求是否需要调用本地/远程工具（用于 hybrid 模式安全降级）。
+
+    匹配关键词覆盖：系统健康检查、命令执行、文件操作、网络诊断、
+    SSH 运维、窗口管理、安全审计、文档生成、学术搜索等。
+    """
+    if not user_input:
+        return False
+    text = user_input.lower()
+    tool_keywords = [
+        # 系统/健康/状态
+        "电脑", "计算机", "服务器", "系统", "健康", "体检", "状态", "检查", "查看", "诊断", "监控",
+        "cpu", "内存", "磁盘", "端口", "进程", "服务", "防火墙", "用户", "日志",
+        # 命令执行
+        "运行", "执行", "命令", "cmd", "powershell", "shell", "bash", "terminal",
+        # 文件/代码操作
+        "文件", "读取", "写入", "修改", "创建", "删除", "搜索", "查找", "代码", "项目", "仓库",
+        "read_file", "write_file", "edit_file", "search_files", "list_dir",
+        # 网络/应用
+        "网络", "网速", "ping", "ip", "域名", "网站", "搜索", "打开", "浏览器", "应用",
+        # SSH/运维
+        "ssh", "远程", "部署", "docker", "容器", "防火墙", "服务", "进程",
+        # 安全/文档/学术
+        "审计", "漏洞", "安全", "生成文档", "word", "excel", "pdf", "论文", "文献", "arxiv",
+        # 窗口/语音
+        "窗口", "截图", "剪贴板", "语音", "朗读", "录音",
+    ]
+    return any(kw in text for kw in tool_keywords)
+
+
+def _split_csv_args(s: str) -> list:
+    """拆分函数调用参数字符串，尊重引号内的逗号。
+
+    用于解析 <tool_call>name(a="1,2", b=3)</tool_call> 中的参数。
+    """
+    parts = []
+    current = ""
+    in_quote = None
+    for ch in s:
+        if ch in ('"', "'"):
+            if in_quote == ch:
+                in_quote = None
+            elif in_quote is None:
+                in_quote = ch
+            current += ch
+        elif ch == "," and in_quote is None:
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
+def _parse_tool_call_xml(text: str) -> list:
+    """解析模型输出的 <tool_call>...</tool_call> 伪 XML 工具调用。
+
+    某些模型（如 GLM-4.7-Flash）即使提供了 tools 参数，仍会输出文本形式的
+    <tool_call>name(args)</tool_call> 而不是标准的 delta.tool_calls。
+    本函数做兜底解析，返回 [{"name": "...", "arguments": "json-string"}, ...]。
+    """
+    if not text:
+        return []
+    calls = []
+    pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+    for match in pattern.finditer(text):
+        inner = match.group(1).strip()
+        call = {"name": "", "arguments": "{}"}
+        # 1) 尝试 JSON 格式：{"name": "...", "arguments": {...}}
+        try:
+            data = json.loads(inner)
+            if isinstance(data, dict):
+                call["name"] = data.get("name", data.get("function", {}).get("name", ""))
+                args = data.get("arguments", data.get("function", {}).get("arguments", {}))
+                if isinstance(args, dict):
+                    call["arguments"] = json.dumps(args, ensure_ascii=False)
+                else:
+                    call["arguments"] = str(args)
+                if call["name"]:
+                    calls.append(call)
+                continue
+        except Exception:
+            pass
+        # 2) 尝试 name(args) 或 name(key=value, ...) 格式
+        m = re.match(r"(\w+)\s*\((.*)\)\s*$", inner, re.DOTALL)
+        if m:
+            name, args_str = m.group(1), m.group(2).strip()
+            call["name"] = name
+            args = {}
+            if args_str:
+                for part in _split_csv_args(args_str):
+                    if "=" not in part:
+                        continue
+                    k, v = part.split("=", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    # 去除字符串引号
+                    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                        v = v[1:-1]
+                    else:
+                        # 尝试解析数字 / bool / null
+                        try:
+                            if "." in v:
+                                v = float(v)
+                            else:
+                                v = int(v)
+                        except ValueError:
+                            lv = v.lower()
+                            if lv == "true":
+                                v = True
+                            elif lv == "false":
+                                v = False
+                            elif lv in ("none", "null"):
+                                v = None
+                    args[k] = v
+            call["arguments"] = json.dumps(args, ensure_ascii=False)
+            calls.append(call)
+    return calls
+
+
 # GLM语义路由的缓存（避免重复判断）- 使用 LRU 防止内存泄漏
 from collections import OrderedDict
 
@@ -10224,10 +10345,12 @@ def render_markdown(text: str):
 class InfoBar(Static):
     """顶部信息栏（极简灰色）"""
     def render(self):
-        if WORK_MODE == "expert":
+        # 优先使用 app 实例的 work_mode，避免全局 WORK_MODE 与 self.work_mode 不一致
+        app_mode = getattr(self.app, "work_mode", WORK_MODE)
+        if app_mode == "expert":
             mode_text = "专家"
             mode_color = C_PURPLE
-        elif WORK_MODE == "hybrid":
+        elif app_mode == "hybrid":
             mode_text = "混合"
             mode_color = C_CYAN
         else:
@@ -14029,6 +14152,38 @@ class ZeroAI(App):
 
     async def _run_turn(self):
         """执行 Agent 循环 - 流式 + Markdown 渲染（实时更新）"""
+        # ── 安全策略：hybrid 模式下若请求需要调用工具，强制降级到 expert 模式 ──
+        # hybrid 子代理目前不传递 tools 参数，无法执行真正的 function_calling；
+        # 检测到工具类请求时自动切换到 expert 模式，避免模型输出 <tool_call> 伪 XML。
+        _original_work_mode = None
+        if self.work_mode == "hybrid":
+            last_user_text = ""
+            for msg in reversed(self.messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        last_user_text = " ".join(
+                            p.get("text", "") for p in content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                    else:
+                        last_user_text = str(content)
+                    break
+            if _needs_tool_calls(last_user_text):
+                _original_work_mode = self.work_mode
+                self.work_mode = "expert"
+                self._add_static(Text.assemble(
+                    ("  ", C_DIM),
+                    ("[!] 当前请求需要调用系统工具，已自动切换到专家模式执行\n", f"bold {C_YELLOW}"),
+                ))
+        try:
+            await self._run_turn_impl()
+        finally:
+            if _original_work_mode is not None:
+                self.work_mode = _original_work_mode
+
+    async def _run_turn_impl(self):
+        """_run_turn 的实际实现（被 _run_turn 包装以处理模式降级恢复）"""
         self._is_generating = True
         self._stop_generation = False
         # 重置全局停止标志
@@ -14424,6 +14579,19 @@ class ZeroAI(App):
                 self._update_token_bar()
                 # 后续统一使用 body_content（已去除 <think> 标签）
                 full_content = body_content
+                # 兜底：某些模型（如 GLM-4.7-Flash）会以 <tool_call>name(args)</tool_call>
+                # 文本形式输出工具调用，而不是标准 delta.tool_calls。这里解析并转为真实调用。
+                if not tool_calls_buf and full_content:
+                    xml_calls = _parse_tool_call_xml(full_content)
+                    if xml_calls:
+                        for idx, tc in enumerate(xml_calls):
+                            tool_calls_buf[idx] = {
+                                "id": f"call_xml_{idx}_{tc['name']}",
+                                "name": tc["name"],
+                                "args": tc["arguments"],
+                            }
+                        # 从展示内容中移除伪 XML 标签，避免用户看到原始标签
+                        full_content = re.sub(r"<tool_call>.*?</tool_call>", "", full_content, flags=re.DOTALL).strip()
                 # 身份泄露过滤：检测底层模型自报家门，替换为标准 ZeroAI 身份（响应层防线）
                 full_content, _id_leaked = _sanitize_identity_leak(full_content)
                 if _id_leaked:

@@ -32,13 +32,6 @@ classifiers = [
     "Intended Audience :: System Administrators",
 ]
 
-[project.urls]
-Homepage = "https://github.com/gt17641001169-design/zero-ai"
-Documentation = "https://github.com/gt17641001169-design/zero-ai#readme"
-Repository = "https://github.com/gt17641001169-design/zero-ai"
-Issues = "https://github.com/gt17641001169-design/zero-ai/issues"
-Changelog = "https://github.com/gt17641001169-design/zero-ai/blob/main/CHANGELOG.md"
-
 # 核心依赖（pip install 时自动安装）
 dependencies = [
     "textual>=0.47",
@@ -54,6 +47,13 @@ dependencies = [
     "numpy>=1.20",
     "asyncssh>=2.14",
 ]
+
+[project.urls]
+Homepage = "https://github.com/gt17641001169-design/zero-ai"
+Documentation = "https://github.com/gt17641001169-design/zero-ai#readme"
+Repository = "https://github.com/gt17641001169-design/zero-ai"
+Issues = "https://github.com/gt17641001169-design/zero-ai/issues"
+Changelog = "https://github.com/gt17641001169-design/zero-ai/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # 语音功能依赖（可选，体积大）
