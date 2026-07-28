@@ -77,6 +77,27 @@ from .presets import (
     list_presets,
     get_preset_info,
 )
+from .health import (
+    HealthRecord,
+    ReconnectPolicy,
+    MCPHealthMonitor,
+    get_health_monitor,
+    reset_health_monitor,
+)
+from .audit import (
+    AuditRecord,
+    MCPAuditLogger,
+    audit_mcp_call,
+    get_audit_logger,
+    reset_audit_logger,
+)
+from .ecosystem import (
+    ToolConflict,
+    EcosystemStatus,
+    MCPEcosystemManager,
+    get_ecosystem_manager,
+    reset_ecosystem_manager,
+)
 
 
 __all__ = [
@@ -118,4 +139,13 @@ __all__ = [
     "check_preset_dependencies", "check_all_dependencies",
     "install_preset", "uninstall_preset",
     "list_presets", "get_preset_info",
+    # 健康检查（阶段 F.3）
+    "HealthRecord", "ReconnectPolicy", "MCPHealthMonitor",
+    "get_health_monitor", "reset_health_monitor",
+    # 审计日志（阶段 F.4）
+    "AuditRecord", "MCPAuditLogger", "audit_mcp_call",
+    "get_audit_logger", "reset_audit_logger",
+    # 生态系统管理（阶段 F.1 + F.2）
+    "ToolConflict", "EcosystemStatus", "MCPEcosystemManager",
+    "get_ecosystem_manager", "reset_ecosystem_manager",
 ]
