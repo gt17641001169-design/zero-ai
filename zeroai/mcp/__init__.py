@@ -68,6 +68,15 @@ from .server import (
     run_stdio_server,
     run_sse_server,
 )
+from .presets import (
+    PRESETS,
+    check_preset_dependencies,
+    check_all_dependencies,
+    install_preset,
+    uninstall_preset,
+    list_presets,
+    get_preset_info,
+)
 
 
 __all__ = [
@@ -104,4 +113,9 @@ __all__ = [
     "MCPServer",
     "create_zeroai_server",
     "run_stdio_server", "run_sse_server",
+    # 预设
+    "PRESETS",
+    "check_preset_dependencies", "check_all_dependencies",
+    "install_preset", "uninstall_preset",
+    "list_presets", "get_preset_info",
 ]

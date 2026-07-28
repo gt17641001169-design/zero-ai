@@ -173,6 +173,9 @@ from .agent import (
     PLANNER_PLAN_SYSTEM_PROMPT,
     get_advanced_agent_loop,
     reset_advanced_agent_loop,
+    # 阶段 B.4 多 Agent 协作
+    AgentRole,
+    MultiAgentCollaborator,
 )
 
 __all__ = [
@@ -233,4 +236,6 @@ __all__ = [
     "REFLECTION_SYSTEM_PROMPT", "SUMMARIZER_SYSTEM_PROMPT",
     "PLANNER_PLAN_SYSTEM_PROMPT",
     "get_advanced_agent_loop", "reset_advanced_agent_loop",
+    # 阶段 B.4 多 Agent 协作
+    "AgentRole", "MultiAgentCollaborator",
 ]

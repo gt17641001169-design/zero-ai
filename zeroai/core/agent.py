@@ -1727,6 +1727,297 @@ def reset_advanced_agent_loop() -> None:
     _advanced_agent_loop_instance = None
 
 
+# ============================================================================
+# 多 Agent 协作机制（阶段 B.4）
+# ============================================================================
+
+@dataclass
+class AgentRole:
+    """Agent 角色定义"""
+    name: str
+    specialty: str  # 专长描述
+    system_prompt: str
+    model_key: str = "glm"
+    tools_whitelist: Optional[List[str]] = None  # None=全部工具，列表=仅允许这些工具
+
+
+class MultiAgentCollaborator:
+    """多 Agent 协作器 - 多个 Agent 分工合作完成复杂任务
+
+    工作模式：
+    1. 协调者（Orchestrator）分析任务，分配子任务给专家 Agent
+    2. 各专家 Agent 独立完成子任务（并行）
+    3. 协调者汇总各专家结果，生成最终答案
+
+    应用场景：
+    - 代码审查：coder 写代码 → reasoner 审查逻辑 → security 检查漏洞
+    - 文档生成：knowledge 收集资料 → chinese 撰写 → academic 校对引用
+    - 复杂调试：coder 复现 → reasoner 分析根因 → coder 修复
+
+    使用示例：
+        collab = MultiAgentCollaborator()
+        collab.add_role(AgentRole(
+            name="coder",
+            specialty="代码编写",
+            system_prompt="你是代码专家",
+            tools_whitelist=["read_file", "write_file", "run_command"],
+        ))
+        collab.add_role(AgentRole(
+            name="reviewer",
+            specialty="代码审查",
+            system_prompt="你是审查专家",
+            tools_whitelist=["read_file"],
+        ))
+        result = await collab.run("实现并审查一个排序算法", messages)
+    """
+
+    def __init__(
+        self,
+        orchestrator_model: str = "glm",
+        max_steps_per_agent: int = 5,
+    ):
+        self.orchestrator_model = orchestrator_model
+        self.max_steps_per_agent = max_steps_per_agent
+        self.roles: Dict[str, AgentRole] = {}
+
+        # 回调
+        self.on_agent_start: Optional[Callable[[str, str], Awaitable[None]]] = None
+        self.on_agent_done: Optional[Callable[[str, str, str], Awaitable[None]]] = None
+        self.on_orchestrator_thought: Optional[Callable[[str], Awaitable[None]]] = None
+
+    def add_role(self, role: AgentRole) -> None:
+        """添加一个 Agent 角色"""
+        self.roles[role.name] = role
+
+    def remove_role(self, name: str) -> None:
+        """移除一个角色"""
+        self.roles.pop(name, None)
+
+    async def _decompose_task(
+        self,
+        task: str,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """协调者分解任务为子任务
+
+        Returns:
+            [{"role": "agent_name", "subtask": "子任务描述"}, ...]
+        """
+        if not self.roles:
+            return []
+
+        roles_desc = "\n".join(
+            f"- {r.name}: {r.specialty}" for r in self.roles.values()
+        )
+
+        prompt = f"""你是任务协调者。请将以下任务分解为子任务，分配给合适的专家 Agent。
+
+可用专家：
+{roles_desc}
+
+任务：{task}
+
+请输出 JSON 数组，每个元素包含 role（专家名）和 subtask（子任务描述）：
+```json
+[{{"role": "expert_name", "subtask": "子任务描述"}}]
+```
+
+规则：
+1. 只分配给可用的专家
+2. 子任务应具体明确
+3. 最多分配 4 个子任务
+4. 如果任务简单，可以只分配 1 个专家"""
+
+        client = LLMClient(model_key=self.orchestrator_model)
+        msgs = [{"role": "user", "content": prompt}]
+        resp = await client.chat(msgs, temperature=0.3)
+
+        # 解析 JSON
+        try:
+            json_str = re.search(r'\[[\s\S]*?\]', resp)
+            if json_str:
+                tasks = json.loads(json_str.group())
+                # 过滤无效角色
+                valid = [
+                    t for t in tasks
+                    if isinstance(t, dict)
+                    and t.get("role") in self.roles
+                    and t.get("subtask")
+                ]
+                return valid[:4]  # 最多 4 个
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # 回退：将整个任务分配给第一个专家
+        first_role = next(iter(self.roles), None)
+        if first_role:
+            return [{"role": first_role, "subtask": task}]
+        return []
+
+    async def _run_single_agent(
+        self,
+        role: AgentRole,
+        subtask: str,
+        messages: List[Dict[str, Any]],
+        shared_context: str = "",
+    ) -> str:
+        """运行单个专家 Agent 完成子任务"""
+        if self.on_agent_start:
+            try:
+                await self.on_agent_start(role.name, subtask)
+            except Exception:
+                pass
+
+        # 构造工具集（按白名单过滤）
+        try:
+            from zeroai.tools.registry import TOOLS, TOOL_MAP
+        except Exception:
+            TOOLS, TOOL_MAP = [], {}
+
+        if role.tools_whitelist:
+            tools_schema = [
+                t for t in TOOLS
+                if t.get("function", {}).get("name", "") in role.tools_whitelist
+            ]
+            tool_map = {
+                k: v for k, v in TOOL_MAP.items()
+                if k in role.tools_whitelist
+            }
+        else:
+            tools_schema = list(TOOLS)
+            tool_map = dict(TOOL_MAP)
+
+        # 创建 Agent Loop
+        planner = ReActPlanner(model_key=role.model_key)
+        planner.system_prompt = role.system_prompt  # 注入角色 prompt
+
+        loop = AdvancedAgentLoop(
+            planner=planner,
+            tool_map=tool_map,
+            tools_schema=tools_schema,
+            max_steps=self.max_steps_per_agent,
+            enable_reflexion=True,
+            enable_parallel=False,  # 单 Agent 内不并行，避免冲突
+            enable_summarize=True,
+        )
+
+        # 注入共享上下文
+        enhanced_subtask = subtask
+        if shared_context:
+            enhanced_subtask = f"{subtask}\n\n[其他专家的中间结果]\n{shared_context}"
+
+        # 运行
+        final_answer, _, _ = await loop.run_with_chain(
+            user_input=enhanced_subtask,
+            messages=list(messages),  # 副本，避免污染
+        )
+
+        if self.on_agent_done:
+            try:
+                await self.on_agent_done(role.name, subtask, final_answer)
+            except Exception:
+                pass
+
+        return final_answer
+
+    async def _synthesize_results(
+        self,
+        task: str,
+        results: Dict[str, str],
+        messages: List[Dict[str, Any]],
+    ) -> str:
+        """协调者汇总各专家结果"""
+        results_text = "\n\n".join(
+            f"## {role} 的结果\n{result}"
+            for role, result in results.items()
+            if result
+        )
+
+        prompt = f"""你是任务协调者。请汇总以下各专家的工作结果，生成最终答案。
+
+原始任务：{task}
+
+各专家结果：
+{results_text}
+
+请综合所有结果，生成完整、连贯的最终答案。如有冲突，请指出并给出最合理的结论。"""
+
+        client = LLMClient(model_key=self.orchestrator_model)
+        msgs = [{"role": "user", "content": prompt}]
+        final = await client.chat(msgs, temperature=0.5)
+
+        if self.on_orchestrator_thought:
+            try:
+                await self.on_orchestrator_thought("汇总各专家结果")
+            except Exception:
+                pass
+
+        return final
+
+    async def run(
+        self,
+        task: str,
+        messages: List[Dict[str, Any]],
+    ) -> Tuple[str, Dict[str, str]]:
+        """运行多 Agent 协作
+
+        Args:
+            task: 用户任务
+            messages: 对话历史
+
+        Returns:
+            (final_answer, {role_name: subtask_result})
+        """
+        # 1. 协调者分解任务
+        if self.on_orchestrator_thought:
+            try:
+                await self.on_orchestrator_thought("分析任务并分配子任务")
+            except Exception:
+                pass
+
+        subtasks = await self._decompose_task(task, messages)
+
+        if not subtasks:
+            # 无法分解，直接用第一个专家处理
+            if self.roles:
+                first_role = next(iter(self.roles.values()))
+                result = await self._run_single_agent(first_role, task, messages)
+                return result, {first_role.name: result}
+            return "无可用的专家 Agent。", {}
+
+        # 2. 并行执行子任务（无依赖时）
+        # 检查是否有依赖（简单策略：如果子任务数<=2，并行；否则串行传递上下文）
+        results: Dict[str, str] = {}
+        shared_context = ""
+
+        if len(subtasks) <= 2:
+            # 并行执行
+            async def _run_one(sub: Dict[str, Any]) -> Tuple[str, str]:
+                role = self.roles[sub["role"]]
+                result = await self._run_single_agent(role, sub["subtask"], messages)
+                return sub["role"], result
+
+            tasks_list = [_run_one(s) for s in subtasks]
+            done = await asyncio.gather(*tasks_list, return_exceptions=True)
+            for item in done:
+                if isinstance(item, tuple) and len(item) == 2:
+                    results[item[0]] = item[1]
+        else:
+            # 串行执行，传递上下文
+            for sub in subtasks:
+                role = self.roles[sub["role"]]
+                result = await self._run_single_agent(
+                    role, sub["subtask"], messages, shared_context
+                )
+                results[role.name] = result
+                shared_context += f"\n[{role.name}]: {result[:500]}\n"
+
+        # 3. 协调者汇总
+        final = await self._synthesize_results(task, results, messages)
+
+        return final, results
+
+
 __all__ = [
     # 基础（向后兼容）
     "ReActPlanner",
@@ -1746,4 +2037,7 @@ __all__ = [
     "PLANNER_PLAN_SYSTEM_PROMPT",
     "get_advanced_agent_loop",
     "reset_advanced_agent_loop",
+    # 阶段 B.4 多 Agent 协作
+    "AgentRole",
+    "MultiAgentCollaborator",
 ]

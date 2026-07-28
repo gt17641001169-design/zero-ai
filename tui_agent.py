@@ -12989,6 +12989,55 @@ class ZeroAI(App):
         scroll.mount(welcome)
         self.query_one("#input", MessageInput).focus()
 
+        # 后台异步初始化 MCP 工具（不阻塞 UI）
+        self._auto_init_mcp()
+
+    def _auto_init_mcp(self) -> None:
+        """后台异步初始化 MCP 工具
+
+        读取 ~/.zeroai/mcp_config.json，连接所有 enabled 的服务器。
+        首次启动或无配置时静默跳过，不影响主程序。
+        """
+        try:
+            from zeroai.mcp import get_mcp_config
+            config = get_mcp_config()
+            servers = config.list_servers(only_enabled=True)
+            if not servers:
+                return  # 无配置，静默跳过
+
+            # 异步执行初始化
+            async def _do_init():
+                try:
+                    from zeroai.mcp import initialize_mcp_tools
+                    result = await initialize_mcp_tools(timeout_per_server=10.0)
+                    if result["tools_added"] > 0:
+                        # 在 TUI 中显示提示（使用 call_after_refresh 保证线程安全）
+                        def _show_notice():
+                            try:
+                                self._add_static(Text.assemble(
+                                    ("  ┌──────────────────────────────────┐\n", f"bold {C_FG}"),
+                                    (f"  │ ✓ MCP 工具已加载：{result['tools_added']} 个\n", f"bold {C_FG}"),
+                                    (f"  │   连接 {len(result['connected'])} 个服务器\n", f"bold {C_FG}"),
+                                    ("  └──────────────────────────────────┘\n", f"bold {C_FG}"),
+                                ))
+                            except Exception:
+                                pass
+                        self.call_after_refresh(_show_notice)
+                except Exception:
+                    pass  # 静默失败，不影响主程序
+
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(_do_init())
+                else:
+                    loop.run_until_complete(_do_init())
+            except RuntimeError:
+                pass  # 无事件循环，跳过
+        except Exception:
+            pass  # MCP 模块导入失败，静默跳过
+
     def _add_block(self, header: str, header_color: str = C_BLUE) -> Static:
         """添加一个消息块，返回 Static widget 以便后续 update"""
         scroll = self.query_one("#log-scroll", VerticalScroll)
@@ -13520,6 +13569,17 @@ class ZeroAI(App):
             ))
             self.query_one("#input", MessageInput).value = ""
             return
+        if user_input in ("/react plan", "/智能体 plan", "/智能体 规划"):
+            # 切换 Plan-and-Execute 模式
+            self._react_plan_mode = not getattr(self, "_react_plan_mode", False)
+            status = "开启" if self._react_plan_mode else "关闭"
+            self._add_static(Text.assemble(
+                ("  Plan-and-Execute 模式已", C_DIM),
+                (f"{status}\n", f"bold {C_FG}"),
+                ("  先制定完整计划，再逐步执行\n", C_DIM),
+            ))
+            self.query_one("#input", MessageInput).value = ""
+            return
         if user_input in ("/index", "/索引"):
             # 构建项目向量索引
             self._add_static(Text.assemble(
@@ -13585,6 +13645,15 @@ class ZeroAI(App):
                     ("  └─ 查询失败：", C_DIM),
                     (f"{e}\n", f"bold {C_YELLOW}"),
                 ))
+            self.query_one("#input", MessageInput).value = ""
+            return
+        if user_input in ("/mcp", "/MCP"):
+            await self._handle_mcp_command("")
+            self.query_one("#input", MessageInput).value = ""
+            return
+        if user_input.startswith("/mcp ") or user_input.startswith("/MCP "):
+            cmd = user_input[5:].strip()
+            await self._handle_mcp_command(cmd)
             self.query_one("#input", MessageInput).value = ""
             return
         if user_input in ("/model", "/模型"):
@@ -13737,6 +13806,7 @@ class ZeroAI(App):
             ("    /智能体        切换 ReAct Agent 模式（观察→思考→行动）\n", C_FG),
             ("    /索引          构建项目向量索引（启用 RAG 检索）\n", C_FG),
             ("    /记忆          查看向量记忆统计\n", C_FG),
+            ("    /mcp           MCP 协议管理（list/install/connect/tools）\n", C_FG),
             ("    /模型          查看当前模型和专家团队\n", C_FG),
             ("    /模型 glm      切换到智谱GLM（手动模式）\n", C_FG),
             ("    /模型 glm-v    切换到智谱GLM-4V（多模态，支持图片）\n", C_FG),
@@ -14273,10 +14343,244 @@ class ZeroAI(App):
             if _original_work_mode is not None:
                 self.work_mode = _original_work_mode
 
-    async def _run_react_turn(self):
-        """ReAct Agent 模式：观察→思考→行动 循环
+    async def _handle_mcp_command(self, cmd: str):
+        """处理 /mcp 命令系统
 
-        复用 zeroai.core.agent.AgentLoop，通过回调更新 TUI 显示。
+        子命令：
+            /mcp                  显示 MCP 状态
+            /mcp list             列出预设服务器
+            /mcp install <name>   安装预设（如 filesystem）
+            /mcp uninstall <name> 卸载服务器
+            /mcp connect          连接所有已启用服务器
+            /mcp disconnect       断开所有连接
+            /mcp tools            列出已加载的 MCP 工具
+            /mcp enable <name>    启用服务器
+            /mcp disable <name>   禁用服务器
+        """
+        from zeroai.mcp import (
+            get_mcp_config, get_mcp_registry,
+            initialize_mcp_tools, shutdown_mcp_tools,
+            list_presets, install_preset, uninstall_preset,
+            check_preset_dependencies,
+        )
+
+        if not cmd or cmd in ("status", "状态"):
+            # 显示 MCP 状态
+            registry = get_mcp_registry()
+            config = get_mcp_config()
+            servers = config.list_servers()
+            enabled_count = sum(1 for s in servers if s.enabled)
+
+            status_lines = [
+                ("  MCP 协议支持\n", f"bold {C_YELLOW}"),
+                (f"  已配置服务器：{len(servers)} 个（{enabled_count} 个启用）\n", C_DIM),
+                (f"  注册器状态：{'已初始化' if registry.is_initialized else '未初始化'}\n", C_DIM),
+            ]
+
+            if registry.is_initialized:
+                status_text = registry.get_status_text()
+                for line in status_text.split("\n"):
+                    status_lines.append((f"  {line}\n", C_FG))
+            else:
+                status_lines.append((
+                    "  输入 /mcp connect 初始化 MCP 工具\n", C_DIM
+                ))
+
+            status_lines.append(("  ───────────────────────────\n", C_DIM))
+            status_lines.append(("  /mcp list     查看可用预设\n", C_FG))
+            status_lines.append(("  /mcp install <name>  安装预设\n", C_FG))
+            status_lines.append(("  /mcp connect  连接所有服务器\n", C_FG))
+            status_lines.append(("  /mcp tools    查看已加载工具\n", C_FG))
+
+            self._add_static(Text.assemble(*status_lines))
+            return
+
+        parts = cmd.split(maxsplit=1)
+        action = parts[0].lower()
+
+        if action in ("list", "ls", "预设", "presets"):
+            # 列出预设
+            presets = list_presets()
+            lines = [("  可用 MCP 服务器预设\n", f"bold {C_YELLOW}")]
+            for p in presets:
+                status_icon = "✓" if p["dependencies_available"] else "✗"
+                installed_icon = "+" if p["installed"] else " "
+                color = C_FG if p["dependencies_available"] else C_DIM
+                lines.append((
+                    f"  {status_icon} [{installed_icon}] {p['name']:<20} {p['description']}\n",
+                    color,
+                ))
+                if not p["dependencies_available"]:
+                    lines.append((f"      └─ {p['install_hint']}\n", C_DIM))
+            lines.append(("\n  说明：✓=依赖可用  ✗=缺失  [+=已安装]\n", C_DIM))
+            lines.append(("  安装：/mcp install <名称>\n", C_FG))
+            self._add_static(Text.assemble(*lines))
+            return
+
+        if action in ("install", "安装"):
+            if len(parts) < 2:
+                self._add_static(Text.assemble(
+                    ("  用法：/mcp install <预设名> [参数]\n", C_DIM),
+                    ("  示例：/mcp install filesystem paths=D:\\C\\C\n", C_FG),
+                    ("        /mcp install fetch\n", C_FG),
+                    ("        /mcp install sqlite db_path=test.db\n", C_FG),
+                ))
+                return
+
+            args_str = parts[1]
+            arg_parts = args_str.split(maxsplit=1)
+            preset_name = arg_parts[0]
+            extra_args = {}
+
+            if len(arg_parts) > 1:
+                # 解析 key=value 格式
+                for kv in arg_parts[1].split():
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        extra_args[k.strip()] = v.strip()
+
+            # 检查依赖
+            dep = check_preset_dependencies(preset_name)
+            if not dep["available"]:
+                self._add_static(Text.assemble(
+                    (f"  ✗ 依赖缺失：{dep['missing']}\n", f"bold {C_YELLOW}"),
+                    (f"  {dep['install_hint']}\n", C_DIM),
+                ))
+                return
+
+            # 安装
+            if install_preset(preset_name, extra_args=extra_args):
+                self._add_static(Text.assemble(
+                    (f"  ✓ 已安装预设：{preset_name}\n", f"bold {C_FG}"),
+                    ("  输入 /mcp connect 连接服务器\n", C_DIM),
+                ))
+            else:
+                self._add_static(Text.assemble(
+                    (f"  ✗ 安装失败：{preset_name}\n", f"bold {C_YELLOW}"),
+                ))
+            return
+
+        if action in ("uninstall", "卸载", "remove"):
+            if len(parts) < 2:
+                self._add_static(Text.assemble(
+                    ("  用法：/mcp uninstall <服务器名>\n", C_DIM),
+                ))
+                return
+            name = parts[1].strip()
+            if uninstall_preset(name):
+                self._add_static(Text.assemble(
+                    (f"  ✓ 已卸载：{name}\n", f"bold {C_FG}"),
+                ))
+            else:
+                self._add_static(Text.assemble(
+                    (f"  ✗ 未找到服务器：{name}\n", f"bold {C_YELLOW}"),
+                ))
+            return
+
+        if action in ("connect", "连接", "init"):
+            # 连接所有已启用的 MCP 服务器
+            block = self._add_block("MCP 初始化", C_CYAN)
+            block.update(Text.assemble(
+                (f"  正在连接 MCP 服务器…\n", f"bold {C_CYAN}"),
+            ))
+            try:
+                result = await initialize_mcp_tools(timeout_per_server=15.0)
+                lines = [
+                    (f"  MCP 工具初始化完成\n", f"bold {C_FG}"),
+                    (f"  成功连接：{len(result['connected'])} 个服务器\n", C_FG),
+                ]
+                if result["connected"]:
+                    lines.append(("    " + ", ".join(result["connected"]) + "\n", C_DIM))
+                if result["failed"]:
+                    lines.append((f"  连接失败：{len(result['failed'])} 个\n", f"bold {C_YELLOW}"))
+                    for name, err in result["failed"]:
+                        lines.append((f"    {name}: {err}\n", C_DIM))
+                lines.append((f"  加载工具：{result['tools_added']} 个\n", f"bold {C_FG}"))
+                if result["tools_added"] > 0:
+                    lines.append(("  MCP 工具已注入 TOOL_MAP，Agent 可透明调用\n", C_DIM))
+                self._add_static(Text.assemble(*lines))
+            except Exception as e:
+                self._add_static(Text.assemble(
+                    ("  └─ MCP 初始化错误：", C_DIM),
+                    (f"{e}\n", f"bold {C_YELLOW}"),
+                ))
+            return
+
+        if action in ("disconnect", "断开", "shutdown"):
+            try:
+                await shutdown_mcp_tools()
+                self._add_static(Text.assemble(
+                    ("  ✓ 已断开所有 MCP 连接\n", f"bold {C_FG}"),
+                ))
+            except Exception as e:
+                self._add_static(Text.assemble(
+                    ("  └─ 断开错误：", C_DIM),
+                    (f"{e}\n", f"bold {C_YELLOW}"),
+                ))
+            return
+
+        if action in ("tools", "工具"):
+            # 列出已加载的 MCP 工具
+            registry = get_mcp_registry()
+            if not registry.is_initialized:
+                self._add_static(Text.assemble(
+                    ("  MCP 未初始化，输入 ", C_DIM),
+                    ("/mcp connect", f"bold {C_FG}"),
+                    (" 连接服务器\n", C_DIM),
+                ))
+                return
+            tools = registry.get_tools_schema()
+            if not tools:
+                self._add_static(Text.assemble(
+                    ("  无 MCP 工具\n", C_DIM),
+                ))
+                return
+            lines = [(f"  MCP 工具列表（{len(tools)} 个）\n", f"bold {C_YELLOW}")]
+            for t in tools[:30]:
+                fn = t.get("function", {})
+                lines.append((f"  • {fn.get('name', '?')}\n", C_FG))
+            if len(tools) > 30:
+                lines.append((f"  ... 还有 {len(tools) - 30} 个\n", C_DIM))
+            self._add_static(Text.assemble(*lines))
+            return
+
+        if action in ("enable", "启用"):
+            if len(parts) < 2:
+                self._add_static(Text.assemble(("  用法：/mcp enable <名称>\n", C_DIM)))
+                return
+            name = parts[1].strip()
+            if get_mcp_config().enable_server(name):
+                self._add_static(Text.assemble((f"  ✓ 已启用：{name}\n", f"bold {C_FG}")))
+            else:
+                self._add_static(Text.assemble((f"  ✗ 未找到：{name}\n", f"bold {C_YELLOW}")))
+            return
+
+        if action in ("disable", "禁用"):
+            if len(parts) < 2:
+                self._add_static(Text.assemble(("  用法：/mcp disable <名称>\n", C_DIM)))
+                return
+            name = parts[1].strip()
+            if get_mcp_config().disable_server(name):
+                self._add_static(Text.assemble((f"  ✓ 已禁用：{name}\n", f"bold {C_FG}")))
+            else:
+                self._add_static(Text.assemble((f"  ✗ 未找到：{name}\n", f"bold {C_YELLOW}")))
+            return
+
+        # 未知命令
+        self._add_static(Text.assemble(
+            (f"  未知 MCP 命令：{action}\n", f"bold {C_YELLOW}"),
+            ("  输入 /mcp 查看所有命令\n", C_DIM),
+        ))
+
+    async def _run_react_turn(self):
+        """ReAct Agent 模式（增强版）：观察→思考→行动 循环
+
+        阶段 B 深度升级：
+        - 使用 AdvancedAgentLoop（含思维链、反思、并行、摘要）
+        - 思维链实时可视化（on_thought_chain 回调）
+        - 自动注入 MCP 工具到 Agent 的 tool_map
+        - RAG 自动检索项目上下文（无需 /索引 也可调用）
+        - Plan-and-Execute 模式可选（/智能体 plan 切换）
         """
         self._is_generating = True
         self._stop_generation = False
@@ -14284,8 +14588,13 @@ class ZeroAI(App):
         _GLOBAL_STOP = False
 
         try:
-            from zeroai.core.agent import AgentLoop, ReActPlanner
-            from zeroai.memory import get_retriever
+            from zeroai.core.agent import (
+                AdvancedAgentLoop, ReActPlanner,
+                PlanAndExecutePlanner, ReflexionEngine, ToolResultSummarizer,
+                Thought,
+            )
+            from zeroai.memory import get_retriever, get_conversation_memory
+            from zeroai.tools.registry import TOOLS, TOOL_MAP
 
             # 提取最后一条用户消息
             user_input = ""
@@ -14323,24 +14632,103 @@ class ZeroAI(App):
             except Exception:
                 pass
 
-            # 创建 AgentLoop
+            # B.3: RAG 自动检索 - 即使无索引也尝试对话记忆检索
+            rag_context = ""
+            if retriever:
+                try:
+                    docs = retriever.retrieve(user_input, top_k=3)
+                    if docs:
+                        rag_context = "\n\n[项目上下文]\n" + "\n---\n".join(docs[:3])
+                except Exception:
+                    pass
+
+            # 对话记忆检索（跨会话）
+            try:
+                conv_mem = get_conversation_memory()
+                history = conv_mem.recall(user_input, top_k=2)
+                if history:
+                    rag_context += "\n\n[历史对话]\n" + "\n---\n".join(
+                        h.get("content", "")[:500] for h in history
+                    )
+            except Exception:
+                pass
+
+            # 注入 RAG 上下文到 user_input
+            enhanced_input = user_input + rag_context if rag_context else user_input
+
+            # 收集工具集（内置 + MCP）
+            tools_schema = list(TOOLS)
+            tool_map = dict(TOOL_MAP)
+
+            # 尝试合并 MCP 工具
+            mcp_tools_count = 0
+            try:
+                from zeroai.mcp import get_mcp_registry
+                registry = get_mcp_registry()
+                if registry.is_initialized:
+                    mcp_tools = registry.get_tools_schema()
+                    mcp_funcs = registry.get_tool_functions()
+                    tools_schema.extend(mcp_tools)
+                    tool_map.update(mcp_funcs)
+                    mcp_tools_count = len(mcp_tools)
+            except Exception:
+                pass
+
+            # 创建增强版 AgentLoop
             planner = ReActPlanner(model_key=self.model_key)
-            loop = AgentLoop(
+            loop = AdvancedAgentLoop(
                 planner=planner,
+                tool_map=tool_map,
+                tools_schema=tools_schema,
                 max_steps=self.max_turns,
                 retriever=retriever,
+                enable_plan=getattr(self, "_react_plan_mode", False),
+                enable_reflexion=True,    # 启用反思
+                enable_parallel=True,     # 启用并行
+                enable_summarize=True,    # 启用摘要
             )
+
+            # 思维链可视化 block（实时更新）
+            chain_block = None
 
             # 注册回调：更新 TUI 显示
             async def _on_thought(text):
-                block = self._add_block("思考", C_CYAN)
-                block.update(Text.assemble(
+                nonlocal chain_block
+                if chain_block is None:
+                    chain_block = self._add_block("思考", C_CYAN)
+                chain_block.update(Text.assemble(
                     (f"  {_load_svg_icon('search')} {text}\n", f"bold {C_CYAN}"),
                 ))
 
+            async def _on_thought_chain(thought: Thought):
+                """思维链实时回调：每步推理过程流式展示"""
+                step = thought.step
+                if thought.action_type == "reflect":
+                    # 反思：黄色警告
+                    self._add_static(Text.assemble(
+                        (f"  │ [反思 {step}] ", C_DIM),
+                        (f"工具 {thought.tool_name} 失败\n", f"bold {C_YELLOW}"),
+                        (f"  │   原因：{thought.reflection or '未知'}\n", C_DIM),
+                    ))
+                elif thought.action_type == "parallel_tool_calls":
+                    # 并行调用
+                    self._add_static(Text.assemble(
+                        (f"  │ [并行 {step}] ", C_DIM),
+                        (f"同时执行多个工具\n", f"bold {C_PURPLE}"),
+                    ))
+                elif thought.action_type == "plan":
+                    self._add_static(Text.assemble(
+                        (f"  │ [规划 {step}] ", C_DIM),
+                        (f"{thought.thought[:200]}\n", f"bold {C_BLUE}"),
+                    ))
+
             async def _on_tool_call(name, args):
                 import json as _json
-                tool_info = f"**调用工具** `{name}`\n\n```json\n{_json.dumps(args, ensure_ascii=False, indent=2)}\n```"
+                # 区分 MCP 工具
+                is_mcp = name.startswith("mcp__")
+                tag = "MCP" if is_mcp else "工具"
+                color = C_PURPLE if is_mcp else C_FG
+                tool_info = f"**调用{tag}** `{name}`\n\n```json\n{_json.dumps(args, ensure_ascii=False, indent=2)}\n```"
                 self._add_static(_safe_markdown(tool_info, code_theme="monokai"))
 
             async def _on_tool_result(name, result):
@@ -14360,6 +14748,7 @@ class ZeroAI(App):
                 ))
 
             loop.on_thought = _on_thought
+            loop.on_thought_chain = _on_thought_chain
             loop.on_tool_call = _on_tool_call
             loop.on_tool_result = _on_tool_result
             loop.on_final_answer = _on_final_answer
@@ -14368,24 +14757,54 @@ class ZeroAI(App):
 
             # 标记开始
             block_start = self._add_block("ReAct Agent", C_PURPLE)
-            block_start.update(Text.assemble(
-                (f"  ⏵ ReAct Agent 启动\n", f"bold {C_PURPLE}"),
+            start_parts = [
+                (f"  ⏵ ReAct Agent 启动（增强版）\n", f"bold {C_PURPLE}"),
                 (f"  │ 观察→思考→行动循环（最多 {self.max_turns} 步）\n", C_DIM),
                 (f"  │ RAG 检索：{'已启用' if retriever else '未启用'}\n", C_DIM),
-            ))
+            ]
+            if mcp_tools_count > 0:
+                start_parts.append((f"  │ MCP 工具：{mcp_tools_count} 个\n", C_DIM))
+            start_parts.extend([
+                (f"  │ 增强：反思+并行+摘要\n", C_DIM),
+                (f"  │ 规划模式：{'Plan-and-Execute' if getattr(self, '_react_plan_mode', False) else 'ReAct'}\n", C_DIM),
+            ])
+            block_start.update(Text.assemble(*start_parts))
 
-            # 运行 Agent 循环
-            final_answer, steps = await loop.run(
-                user_input=user_input,
+            # 运行 Agent 循环（增强版，返回思维链）
+            final_answer, steps, chain = await loop.run_with_chain(
+                user_input=enhanced_input,
                 messages=self.messages,
             )
 
             # 显示步数统计
             tool_count = sum(1 for s in steps if s.get("action_type") == "tool_call")
-            self._add_static(Text.assemble(
+            reflect_count = sum(1 for t in chain if t.action_type == "reflect")
+
+            stats_parts = [
                 ("  └─ ", C_DIM),
-                (f"ReAct 完成：{len(steps)} 步 / {tool_count} 次工具调用\n", C_DIM),
-            ))
+                (f"ReAct 完成：{len(steps)} 步 / {tool_count} 次工具调用", C_DIM),
+            ]
+            if reflect_count > 0:
+                stats_parts.append((f" / {reflect_count} 次反思", C_DIM))
+            if mcp_tools_count > 0:
+                stats_parts.append((f" / MCP:{mcp_tools_count}", C_DIM))
+            stats_parts.append(("\n", C_DIM))
+            self._add_static(Text.assemble(*stats_parts))
+
+            # B.3: 保存对话到向量记忆
+            try:
+                conv_mem = get_conversation_memory()
+                await conv_mem.add_turn(
+                    user_input=user_input,
+                    assistant_response=final_answer,
+                    metadata={
+                        "mode": "react_enhanced",
+                        "steps": len(steps),
+                        "tools": tool_count,
+                    },
+                )
+            except Exception:
+                pass
 
         except Exception as e:
             self._add_static(Text.assemble(
