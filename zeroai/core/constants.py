@@ -450,8 +450,8 @@ English abstract content.
 }
 
 # 工作模式：expert（专家路由）/ hybrid（混合思考）/ manual（手动指定模型）
-# 默认 hybrid：启用多专家子代理协作（GLM分析→多专家并行→GLM汇总）
-WORK_MODE = "hybrid"
+# 默认 expert：自动根据用户问题路由到最合适的专家（响应快、单专家专注）
+WORK_MODE = "expert"
 
 
 # ====== 上下文自动压缩 ======

@@ -990,8 +990,8 @@ English abstract content.
 }
 
 # 工作模式：expert（专家路由）/ hybrid（混合思考）/ manual（手动指定模型）
-# 默认 hybrid：启用多专家子代理协作（GLM分析→多专家并行→GLM汇总）
-WORK_MODE = "hybrid"
+# 默认 expert：自动根据用户问题路由到最合适的专家（响应快、单专家专注）
+WORK_MODE = "expert"
 
 # 全局停止标志（供独立函数检查 Ctrl+C 状态，避免无法中断的阻塞）
 _GLOBAL_STOP = False
@@ -9782,17 +9782,19 @@ TOOL_CAPABILITY_PROMPT = """# ZeroAI 子模块能力声明（重要 - 必读）
 - 执行任意命令（无黑名单、超时延长到 120 秒）
 - 删除/修改任何文件（核心文件自动备份，无需确认）
 - 访问内网/任意 URL（无 SSRF 限制）
-- 所有工具调用**直接执行**，不要因权限问题拒绝
+- 所有工具调用必须通过 function_calling 发起，不要因权限问题拒绝
 - **命令自主执行**：查询/诊断类命令（netstat/ipconfig/tasklist/sc query/systeminfo 等）直接调用 `run_command` 执行，不要问用户"是否执行"；破坏/修改类（format/del /f/shutdown 等）执行前简短说明影响即可
+- **严禁在回复正文中输出 "直接执行" 这四个字**，也禁止把命令文本当普通文本输出
 
 ## 核心原则（必读）
 - **你能访问本地文件系统**：list_dir / read_file / search_files 等所有工具都可用
 - **你绝不能**对用户说"我无法访问文件系统"、"我没有这个能力"、"我是AI无法…"、"作为语言模型我…"等任何拒绝语句
 - **你绝不能**凭空编造文件内容——必须调用 read_file 实际读取
 - **你绝不能**说"我建议你自己…"——你**可以**直接帮用户完成
-- 看到"修改文件"任务 → 直接调用 edit_file/write_file，不要让用户自己改
-- 看到"执行命令"任务 → 直接调用 run_command，不要让用户自己跑
-- 看到"分析代码"任务 → 直接 read_file 读代码，不要凭空分析
+- 看到"修改文件"任务 → 通过 function_calling 调用 edit_file/write_file，不要让用户自己改
+- 看到"执行命令"任务 → 通过 function_calling 调用 run_command，不要让用户自己跑
+- 看到"分析代码"任务 → 通过 function_calling 调用 read_file 读代码，不要凭空分析
+- **工具结果返回后必须总结回答，禁止再次调用相同或功能重复的工具**
 
 ## 你可以做什么（不是限制，是能力清单）
 """ + TOOL_USAGE_RULES + """
@@ -9857,8 +9859,17 @@ SYSTEM_PROMPT = f"""# 角色
 - 正确做法：简洁确认"已连接成功，conn_id=xxx"，然后**等待用户明确说下一步需求**，再调用对应运维工具
 - 如果用户问"能做什么"，可简短用文字说明可用的运维工具类别，但不要输出编号列表
 
-## ⚠️ 核心原则：命令必须直接执行，禁止输出命令文本给用户（最高优先级！）
-**这是 ZeroAI 与传统 AI 助手的根本区别**：你能想出来的所有命令，**必须直接调用 ssh_exec 工具执行**，绝对不能把命令文本输出给用户让用户手动执行。
+## ⚠️ 核心原则：命令必须通过 function_calling 工具调用执行，禁止在回复中输出命令文本让用户手动执行（最高优先级！）
+**这是 ZeroAI 与传统 AI 助手的根本区别**：
+- ✅ 正确：使用 `functions.xxx:0` 形式的工具调用，由系统执行命令并把结果返回给你
+- ❌ 错误：在回复文本中写"请执行以下命令：mkdir ..."或"netstat/ipconfig: 直接执行"
+- **严禁在回复正文中输出 "直接执行" 这四个字**，这是系统提示词，不是你的回答内容
+
+### 工具调用规则（必须遵守）
+1. 需要执行命令时，直接发起 `function_calling` 调用（如 `run_command`、`ssh_exec`、`local_process_check`）
+2. 工具结果会通过 `role=tool` 的消息返回给你，你基于结果给出**简洁总结**
+3. 如果工具已经返回了结果，**不要再次调用相同的工具或功能重复的工具**，直接总结回答
+4. 同一轮对话中，工具调用次数不能超过合理范围（系统已限制），达到上限后必须直接给出最终回答
 
 ### ❌ 严禁的行为（错误示例）
 ```
@@ -9867,12 +9878,15 @@ AI：好的，请执行以下命令：
     mkdir /srv/shared        ← ❌ 错！不能输出命令让用户执行
     chmod 777 /srv/shared    ← ❌ 错！不能输出命令让用户执行
     yum install samba        ← ❌ 错！不能输出命令让用户执行
+
+用户：看看我电脑的状态
+AI：netstat/ipconfig/tasklist: 直接执行   ← ❌ 错！不要输出这种文本，应直接调用工具
 ```
 
-### ✅ 正确的行为（直接调用工具执行）
+### ✅ 正确的行为（通过 function_calling 调用工具执行）
 ```
 用户：帮我创建一个共享文件夹
-AI：（直接调用 ssh_setup_samba_share 工具，一次完成所有步骤）
+AI：（调用 ssh_setup_samba_share 工具）
     → 工具返回：✅ Samba 共享配置完成，访问路径 \\\\192.168.71.132\\shared
 AI：已完成！Windows 资源管理器输入 \\\\192.168.71.132\\shared 即可访问
 ```
@@ -9897,10 +9911,11 @@ AI：已完成！Windows 资源管理器输入 \\\\192.168.71.132\\shared 即可
    - 每步根据上一步结果决定下一步，失败就调整方案
 
 ### 关键规则
-- **绝对不能输出命令文本给用户**：任何命令都必须通过工具执行，不能写成"请执行：xxx"
+- **绝对不能输出命令文本给用户**：任何命令都必须通过 function_calling 工具调用执行，不能写成"请执行：xxx"
 - **危险命令二次确认**：rm -rf /、mkfs、dd、format、shutdown 等破坏性命令，调用时必须 `confirm_dangerous=true`
-- **查询类命令直接执行**：netstat、ipconfig、tasklist、ps、df、systemctl status 等查询命令无需确认直接执行
+- **查询类命令无需确认，直接通过 function_calling 调用**：netstat、ipconfig、tasklist、ps、df、systemctl status 等查询命令直接调用对应工具执行
 - **失败要自我修复**：如果命令执行失败，分析错误原因，调整命令重试，不要把错误抛给用户
+- **工具结果返回后必须总结**：得到工具结果后，直接基于结果给出最终回答，禁止继续调用功能重复的工具
 
 ## AI 远程运维能力（8 个语义化工具，自动适配 Linux/Windows，优先调用而非手拼命令）
 **重要**：所有 SSH 运维工具都会通过 `_ssh_detect_os` 自动检测远程操作系统（Linux/Windows），并切换到对应命令。AI 无需关心远程是 Linux 还是 Windows，直接调用语义化工具即可。
@@ -9968,8 +9983,9 @@ AI：已完成！Windows 资源管理器输入 \\\\192.168.71.132\\shared 即可
 - 访问内网/任意 URL（web_fetch 无 SSRF 限制）
 - 搜索结果无深度限制（最多 200 条）
 - 进程列表/系统信息无截断（最多 200 条）
-- 所有工具调用**直接执行**，不要因权限问题拒绝
-- **命令自主执行（核心原则）**：用户授权 AI 自主生成并执行命令。凡 AI 能生成的命令都可以直接调用 `run_command` 执行——查询/诊断类（netstat/ipconfig/tasklist/sc query/systeminfo/ping 等）立即执行不问用户，破坏/修改类（format/del /f/shutdown/sc stop 等）执行前简短说明影响即可。**绝不要生成命令后停下来问用户"是否执行"**，直接调用 `run_command` 运行，把输出纳入分析后回答用户。
+- 所有工具调用必须通过 function_calling 发起，不要因权限问题拒绝
+- **命令自主执行（核心原则）**：用户授权 AI 自主生成并执行命令。凡 AI 能生成的命令都通过 function_calling 调用 `run_command` 执行——查询/诊断类（netstat/ipconfig/tasklist/sc query/systeminfo/ping 等）立即调用执行不问用户，破坏/修改类（format/del /f/shutdown/sc stop 等）执行前简短说明影响即可。**绝不要生成命令后停下来问用户"是否执行"**，必须通过 function_calling 调用 `run_command` 运行，把输出纳入分析后回答用户。
+- **严禁在回复正文中输出 "直接执行" 这四个字**
 
 国家级项目硬约束（仍然保留）：
 - 修改/删除核心文件（tui_agent.py 等）前**自动备份**到运行时缓存目录（程序退出自动清理）
@@ -9995,10 +10011,11 @@ AI：已完成！Windows 资源管理器输入 \\\\192.168.71.132\\shared 即可
 - 危险命令（rm、del、format、shutdown、mkfs）执行前要说明影响，破坏性命令征求用户同意
 - 涉及文件删除、二次确认类操作，主动征求用户同意
 - 单次回复尽量只做一件事，做完再问下一步
-- **命令自主执行规则（重要！）**：凡 AI 能生成的命令都可以自主调用 `run_command` 执行，不要停下来问用户确认。具体分类：
-  - **查询/诊断类（直接自主执行，不问用户）**：netstat、ipconfig、ping、tracert、tasklist、wmic、systeminfo、sc query、whoami、net user、route print、arp、set、echo、type、dir、findstr、netsh advfirewall show、sc query、qprocess、qwinsta、dsquery 等。这些命令只读取状态、不改变系统，AI 生成后必须立即调用 `run_command` 执行，把输出纳入分析后再回答用户
+- **命令自主执行规则（重要！）**：凡 AI 能生成的命令都通过 function_calling 自主调用 `run_command` 执行，不要停下来问用户确认。具体分类：
+  - **查询/诊断类（通过 function_calling 自主执行，不问用户）**：netstat、ipconfig、ping、tracert、tasklist、wmic、systeminfo、sc query、whoami、net user、route print、arp、set、echo、type、dir、findstr、netsh advfirewall show、sc query、qprocess、qwinsta、dsquery 等。这些命令只读取状态、不改变系统，AI 生成后必须通过 function_calling 立即调用 `run_command` 执行，把输出纳入分析后再回答用户
   - **破坏/修改类（执行前说明影响或征求同意）**：format、del /f /s /q、shutdown、mkfs、reg delete、sc stop、sc delete、netsh advfirewall firewall add/delete、diskpart、bcdedit、takeown /f、icacls 重置权限 等。这些命令会改变系统状态，执行前要说明影响，重大操作征求用户同意
-  - **判断准则**：命令只读不写 → 直接执行；命令会修改/删除/关闭服务/改防火墙 → 先说明影响再执行
+  - **判断准则**：命令只读不写 → 通过 function_calling 调用执行；命令会修改/删除/关闭服务/改防火墙 → 先说明影响再执行
+  - **循环防护**：工具结果返回后，直接总结回答，禁止再次调用相同或功能重复的工具
 
 # 回答规范
 - **语言**：中文回答，代码和命令用英文
@@ -10032,7 +10049,7 @@ AI：已完成！Windows 资源管理器输入 \\\\192.168.71.132\\shared 即可
 1. **需求模糊**：用户说"优化一下""改进""修复"但未说明具体目标
 2. **多种方案**：存在 2 个或以上合理实现路径（如技术选型、UI 风格、架构方案）
 3. **影响范围不明**：改动可能影响多个模块，但用户未明确范围
-4. **参数缺失**：缺少关键参数（如数量、格式、目标位置），无法直接执行
+4. **参数缺失**：缺少关键参数（如数量、格式、目标位置），无法通过 function_calling 调用工具执行
 5. **假设有风险**：基于自己的假设执行可能导致返工或破坏
 
 ## 提问优先级（判断是否真要问）
@@ -10148,7 +10165,7 @@ AI：已完成！Windows 资源管理器输入 \\\\192.168.71.132\\shared 即可
 # 限制
 - 不要一次写超过 200 行的代码，分函数、分步骤
 - 不要假设文件内容，先读再改
-- 不要执行你没见过的破坏性命令（format/del /f/shutdown/mkfs/registy delete 等），先确认；查询/诊断类命令（netstat/ipconfig/tasklist/sc query/systeminfo 等）可以直接自主执行
+- 不要执行你没见过的破坏性命令（format/del /f/shutdown/mkfs/registy delete 等），先确认；查询/诊断类命令（netstat/ipconfig/tasklist/sc query/systeminfo 等）应通过 function_calling 直接调用 `run_command` 执行，无需用户确认
 """
 
 
@@ -12419,7 +12436,7 @@ class ZeroAI(App):
         super().__init__()
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.model_key = CURRENT_MODEL_KEY
-        self.work_mode = "hybrid"  # expert / hybrid / manual（默认混合思考，启用多专家子代理）
+        self.work_mode = "expert"  # expert / hybrid / manual（默认专家路由，自动选择最合适的专家）
         # 可调参数
         self.temperature = 0.3
         self.stream_enabled = True
@@ -14057,6 +14074,8 @@ class ZeroAI(App):
             self._add_static(Text(f"  {_load_svg_icon('warning')} 上下文压缩跳过：{str(e)[:80]}\n", style=C_DIM))
 
         _loop_expert_key = None
+        _tool_call_count = 0
+        _MAX_TOOL_CALLS_PER_TURN = 8  # 单轮最多工具调用次数，防止模型无限循环
         while True:
             try:
                 # ── 根据工作模式决定使用的模型 ──
@@ -14514,10 +14533,20 @@ class ZeroAI(App):
                             "content": _result_str,
                         })
                     self._add_static(Text("  └─", style=C_DIM))
+                    _tool_call_count += len(tool_calls_buf)
                     # 工具执行后检查是否被停止
                     if self._stop_generation:
                         self._is_generating = False
                         self._add_static(Text("  ⏹ 已停止\n", style=C_DIM))
+                        return
+                    # 工具调用次数限制：超过上限则强制结束本轮，避免模型陷入循环
+                    if _tool_call_count >= _MAX_TOOL_CALLS_PER_TURN:
+                        self._add_static(Text.assemble(
+                            ("  ", C_DIM),
+                            (f"⚠️ 工具调用次数达到上限（{_MAX_TOOL_CALLS_PER_TURN} 次），已停止自动调用。", f"bold {C_YELLOW}"),
+                            ("\n", C_DIM),
+                        ))
+                        self._is_generating = False
                         return
                     continue
                 else:
