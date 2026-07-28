@@ -10596,7 +10596,7 @@ class SettingsScreen(ModalScreen):
             mode_items = []
             mode_labels = {"expert": "专家模式（自动路由）", "hybrid": "混合思考（多专家协作）", "manual": "手动模式（指定模型）"}
             for mk, ml in mode_labels.items():
-                tag = " " if mk == self.work_mode else ""
+                tag = " ●" if mk == self.work_mode else ""
                 mode_items.append(ListItem(
                     Label(f"  {ml}  [{mk}]{tag}"), name=f"mode:{mk}"))
             yield ListView(*mode_items, id="mode-list")
@@ -10630,7 +10630,7 @@ class SettingsScreen(ModalScreen):
             for key, cfg in MODEL_CONFIGS.items():
                 if key in builtin_keys:
                     continue
-                tag = " " if key == self.model_key else ""
+                tag = " ●" if key == self.model_key else ""
                 # 显示 Key 状态
                 has_key = bool(cfg.get("api_key", ""))
                 key_status = "✓" if has_key else "未配置"
