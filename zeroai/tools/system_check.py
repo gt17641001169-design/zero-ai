@@ -706,18 +706,3 @@ def check_port(port: int) -> str:
         return "错误：检测超时"
     except Exception as e:
         return f"错误：{e}"
-        for line in lines[:10]:
-            parts = line.split()
-            if len(parts) >= 5:
-                proto, local, foreign, state, pid = parts[0], parts[1], parts[2], parts[3], parts[4]
-                # 查找进程名
-                try:
-                    pr = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                                        capture_output=True, text=True, timeout=5)
-                    pname = pr.stdout.strip().split(",")[0].strip('"') if pr.stdout.strip() else "?"
-                except Exception:
-                    pname = "?"
-                result.append(f"  {proto}  {local}  {state}  PID:{pid} ({pname})")
-        return "\n".join(result)
-    except Exception as e:
-        return f"错误：{e}"

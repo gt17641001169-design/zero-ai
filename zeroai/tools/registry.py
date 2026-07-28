@@ -86,6 +86,10 @@ from zeroai.tools.ssh_ops import (
     ssh_firewall_manage,
     ssh_health_check,
 )
+from zeroai.tools.voice import (
+    speak_tts,
+    listen_asr,
+)
 
 
 # ============================================================================
@@ -540,7 +544,24 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "conn_id": {"type": "string", "description": "SSH连接ID，默认'default'"}},
             "required": [],
-            "additionalProperties": False}}}
+            "additionalProperties": False}}},
+    # ====== 语音交互工具 ======
+    {"type": "function", "function": {
+        "name": "speak_tts", "description": "文本转语音并播放（edge-tts，微软免费TTS，无需API Key）。长文本自动分段朗读。当用户让你朗读、说话、读出来、语音播报时调用。支持中英文混合。",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "要朗读的文本（支持中英文混合，自动清理 Markdown 标记）"},
+            "voice": {"type": "string", "description": "音色：zh-CN-XiaoxiaoNeural(女,默认) / zh-CN-YunxiNeural(男) / zh-CN-YunyangNeural(新闻) / zh-CN-XiaoyiNeural(温柔女)"},
+            "rate": {"type": "string", "description": "语速：+0%(正常) / +10%(加速) / -10%(减速)"},
+            "volume": {"type": "string", "description": "音量：+0%(正常) / +10%(更大) / -10%(更小)"}},
+            "required": ["text"],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "listen_asr", "description": "录音并识别为文字（本地离线，sherpa-onnx+SenseVoice，无需API Key，准确率高，支持中英日韩粤）。当用户让你听、录音、语音输入、语音识别时调用。首次使用会自动下载约220MB模型。",
+        "parameters": {"type": "object", "properties": {
+            "max_seconds": {"type": "integer", "description": "最长录音秒数，默认10，范围1-60"},
+            "silence_seconds": {"type": "number", "description": "静音停止秒数（连续静音超过此值则停止录音），默认1.0"}},
+            "required": [],
+            "additionalProperties": False}}},
 ]
 
 
@@ -597,6 +618,9 @@ TOOL_MAP = {
     "local_firewall_check": local_firewall_check,
     "local_user_check": local_user_check,
     "local_monitor": local_monitor,
+    # 语音交互工具
+    "speak_tts": speak_tts,
+    "listen_asr": listen_asr,
 }
 
 

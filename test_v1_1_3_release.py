@@ -72,14 +72,15 @@ def test_tools_imports():
     from zeroai.tools import (
         file_manager, command_exec, network, system_check,
         security, doc_gen, academic, window_mgr, ssh_ops, registry,
+        voice,
     )
     from zeroai.tools.registry import TOOLS, TOOL_MAP
-    assert len(TOOLS) == 56, f"TOOLS 数量错误: {len(TOOLS)}"
-    assert len(TOOL_MAP) == 56, f"TOOL_MAP 数量错误: {len(TOOL_MAP)}"
+    assert len(TOOLS) == 58, f"TOOLS 数量错误: {len(TOOLS)}"
+    assert len(TOOL_MAP) == 58, f"TOOL_MAP 数量错误: {len(TOOL_MAP)}"
     tools_keys = {t["function"]["name"] for t in TOOLS}
     map_keys = set(TOOL_MAP.keys())
     assert tools_keys == map_keys, "TOOLS 和 TOOL_MAP key 不一致"
-    print(f"  OK: 全部 10 个 tools 子模块导入成功，{len(TOOLS)} 个工具注册")
+    print(f"  OK: 全部 11 个 tools 子模块导入成功，{len(TOOLS)} 个工具注册")
 
 
 def test_tui_wrappers():
