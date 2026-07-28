@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zero-ai-cli"
-version = "1.1.2"
+version = "1.1.3"
 description = "ZeroAI - 终端 AI 编程助手（多专家协作·语音对话·文档生成·安全审计）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,13 +14,30 @@ keywords = ["ai", "cli", "assistant", "coding", "terminal", "zeroai"]
 classifiers = [
     "Environment :: Console",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: C",
+    "Programming Language :: Other",  # Zig
     "Topic :: Software Development :: Code Generators",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Terminals :: Terminal Emulators/X Terminals",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Topic :: Security",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
 ]
+
+[project.urls]
+Homepage = "https://github.com/gt17641001169-design/zero-ai"
+Documentation = "https://github.com/gt17641001169-design/zero-ai#readme"
+Repository = "https://github.com/gt17641001169-design/zero-ai"
+Issues = "https://github.com/gt17641001169-design/zero-ai/issues"
+Changelog = "https://github.com/gt17641001169-design/zero-ai/blob/main/CHANGELOG.md"
 
 # 核心依赖（pip install 时自动安装）
 dependencies = [
@@ -53,12 +70,19 @@ dev = [
 
 [project.scripts]
 # 安装后终端输入 zeroai 即可启动
-zeroai = "tui_agent:main"
+# v1.1.3+：统一入口为 zeroai.main:main，tui_agent:main 仍保留向后兼容
+zeroai = "zeroai.main:main"
 
 [tool.setuptools]
-# 单文件模块，直接打包 tui_agent.py
-py-modules = ["tui_agent"]
+# 包含模块
+py-modules = ["tui_agent", "config"]
+
+[tool.setuptools.packages.find]
+# 包含 zeroai 包及其全部子包（core/tools/tui）
+include = ["zeroai*", "zeroai_tui*"]
 
 [tool.setuptools.package-data]
 # 包含图标资源
 "*" = ["assets/icons/*"]
+# zeroai_tui 包含 Zig 共享库和 C 源码
+"zeroai_tui" = ["*.dll", "*.so", "*.dylib", "src/*.c"]

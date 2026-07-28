@@ -8,8 +8,9 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-green.svg)]()
-[![License](https://img.shields.io/badge/License-Proprietary-orange.svg)]()
-[![PyPI](https://img.shields.io/badge/PyPI-zero--ai--cli-1.1.2-blue.svg)](https://pypi.org/project/zero-ai-cli/)
+[![License](https://img.shields.io/badge/License-Proprietary-orange.svg)](LICENSE)
+[![PyPI](https://img.shields.io/badge/PyPI-zero--ai--cli-1.1.3-blue.svg)](https://pypi.org/project/zero-ai-cli/1.1.3/)
+[![GitHub](https://img.shields.io/badge/GitHub-zero--ai-black.svg)](https://github.com/gt17641001169-design/zero-ai)
 
 </div>
 
@@ -248,6 +249,19 @@ pip install zero-ai-cli[voice]
 ```bash
 zeroai
 ```
+
+或使用 Python 模块入口（推荐）：
+
+```bash
+python -m zeroai                    # 默认 Textual UI（推荐）
+python -m zeroai --ui textual       # 显式指定 Textual UI
+python -m zeroai --ui zeroai-tui    # C/Zig 加速 TUI
+python -m zeroai --expert coder     # 直接指定专家
+python -m zeroai --version          # 查看版本号
+```
+
+> **架构变更说明**：自 v1.1.3 起，项目从单文件 `tui_agent.py` 重构为模块化 `zeroai` 包。
+> `python -m zeroai` 为推荐入口，`python tui_agent.py` 仍可用（向后兼容，已添加弃用提示）。
 
 ### 首次使用配置
 
@@ -597,10 +611,12 @@ cert.key
 ```bash
 git clone https://github.com/gt17641001169-design/zero-ai.git
 cd zero-ai-cli
-pip install -e .
+pip install -e .           # 主包（开发模式）
+pip install -e ".[dev]"    # 开发依赖（build、pyinstaller）
+pip install -e ".[voice]"  # 可选：语音依赖
 ```
 
-开发模式下修改 `tui_agent.py` 即时生效，无需重新安装。
+开发模式下修改 `zeroai/` 包或 `tui_agent.py` 即时生效，无需重新安装。
 
 ### 构建
 
@@ -609,31 +625,96 @@ pip install build
 python -m build
 ```
 
-生成的包在 `dist/` 目录。
+生成的包在 `dist/` 目录（`.whl` 与 `.tar.gz`）。
+
+### 构建 C/Zig 加速层（可选）
+
+```bash
+cd zeroai-tui
+python setup.py build_ext --inplace            # 同时构建 Zig 和 C 扩展
+python setup.py build_ext --inplace --skip-zig # 仅构建 C 扩展（跳过 Zig）
+```
+
+加速层架构：Python → C → Zig（失败自动回退到 C 标量实现）。
+
+### 运行测试
+
+```bash
+# 阶段3 切换块回归测试
+python test_phase3_regression.py
+
+# v1.1.3 发布集成测试
+python test_v1_1_3_release.py
+
+# C/Zig 加速层测试套件
+python -m pytest zeroai-tui/test_zeroai_tui.py zeroai-tui/tests/ -v -p no:xonsh
+```
 
 ### 项目结构
 
 ```
 zero-ai-cli/
-├── tui_agent.py          # 主程序（单文件架构）
-├── ollama_chat.py        # Ollama 集成
-├── ollama_agent.py       # Ollama Agent
-├── terminal_agent.py     # 终端 Agent
-├── pyproject.toml        # 包配置
-├── README.md             # 说明文档
-├── install.bat           # Windows 一键安装脚本
-├── assets/               # 图标资源
-│   └── icons/
-├── zeroai-proxy/         # 代理服务器（API Key 保护）
-│   ├── main.py           # FastAPI 代理主程序
-│   ├── requirements.txt  # 依赖清单
-│   ├── .env.example      # 配置模板
-│   ├── Dockerfile        # Docker 部署
+├── zeroai/                   # 模块化包（推荐入口，v1.1.3+）
+│   ├── core/                 # 核心层（8 个子模块）
+│   │   ├── paths.py          # 路径管理
+│   │   ├── runtime.py        # 运行时缓存与中断控制
+│   │   ├── secrets.py        # 密钥与配置持久化
+│   │   ├── constants.py      # 常量与专家团队
+│   │   ├── expert_route.py   # 专家路由（含 LRUCache）
+│   │   ├── context_compress.py # 上下文压缩
+│   │   ├── model_manager.py  # 模型管理
+│   │   └── response_utils.py # 响应处理工具
+│   ├── tools/                # 工具层（10 个子模块，56 个工具）
+│   │   ├── file_manager.py   # 文件操作
+│   │   ├── command_exec.py   # 命令执行
+│   │   ├── network.py        # 网络操作
+│   │   ├── system_check.py   # 系统检查
+│   │   ├── security.py       # 安全审计
+│   │   ├── doc_gen.py        # 文档生成
+│   │   ├── academic.py       # 学术研究
+│   │   ├── window_mgr.py     # 窗口管理
+│   │   ├── ssh_ops.py        # SSH 远程运维
+│   │   └── registry.py       # 工具注册中心（TOOLS + TOOL_MAP）
+│   ├── tui/                  # TUI 包装层（7 个子模块）
+│   │   ├── colors.py         # 配色常量
+│   │   ├── markdown.py       # Markdown/LaTeX 渲染
+│   │   ├── identity.py       # 身份泄露过滤
+│   │   ├── widgets.py        # 自定义组件
+│   │   ├── screens.py        # 模态对话框
+│   │   ├── app.py            # ZeroAI 主应用类
+│   │   └── icons.py          # 图标加载
+│   ├── main.py               # 统一入口
+│   └── __main__.py           # 模块入口（支持 python -m zeroai）
+├── tui_agent.py              # 原始实现（保留备份，向后兼容，已弃用）
+├── zeroai-tui/               # C/Zig 加速 TUI 框架
+│   ├── zeroai_tui/           # TUI 组件包
+│   │   ├── src/_renderer.c   # C 渲染核心（动态加载 Zig）
+│   │   ├── src/_terminal.c   # C 终端控制
+│   │   └── components.py     # TUI 组件框架
+│   ├── src/zig_render.zig    # Zig 渲染加速
+│   ├── build.zig             # Zig 构建脚本
+│   ├── setup.py              # C/Zig 扩展构建
+│   └── tests/                # 测试套件
+├── zeroai-proxy/             # 代理服务器（API Key 保护）
+│   ├── main.py               # FastAPI 代理主程序
+│   ├── requirements.txt      # 依赖清单
+│   ├── .env.example          # 配置模板
+│   ├── Dockerfile            # Docker 部署
 │   ├── docker-compose.yml
-│   ├── start.sh          # systemd 部署脚本
-│   └── README.md         # 部署文档
-└── libs/ models/         # 语音依赖（开发模式，不入库）
+│   ├── start.sh              # systemd 部署脚本
+│   └── README.md             # 部署文档
+├── assets/icons/             # 图标资源
+├── pyproject.toml            # 包配置
+├── README.md                 # 说明文档
+├── CHANGELOG.md              # 更新日志
+├── CONTRIBUTING.md           # 贡献指南
+├── LICENSE                   # 专有软件许可证
+├── AUTHORS                   # 作者列表
+├── install.bat               # Windows 一键安装脚本
+└── libs/ models/             # 语音依赖（开发模式，不入库）
 ```
+
+详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ---
 
@@ -706,11 +787,19 @@ A: 代理服务器架构下：
 
 ## 许可证
 
-专有软件（Proprietary）。未经授权不得商用。
+专有软件（Proprietary）。未经授权不得商用。详见 [LICENSE](LICENSE)。
 
 ## 作者
 
-ZeroAI Team
+ZeroAI Team。详见 [AUTHORS](AUTHORS)。
+
+## 更新日志
+
+详见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 贡献指南
+
+详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 致谢
 

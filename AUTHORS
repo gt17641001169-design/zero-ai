@@ -1,0 +1,12 @@
+ZeroAI Team <gt17641001169@design.com>
+
+主要贡献者：
+- ZeroAI Team — 项目发起、架构设计、主要实现
+
+致谢：
+- 智谱 AI — GLM 系列模型支持
+- Textual — TUI 框架
+- asyncssh — 异步 SSH 客户端
+- sherpa-onnx — 语音识别引擎
+- Semantic Scholar — 学术文献数据
+- FastAPI — 代理服务框架

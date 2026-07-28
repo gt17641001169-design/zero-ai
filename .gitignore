@@ -30,6 +30,18 @@ zeroai-proxy/.venv/
 zeroai-proxy/logs/
 zeroai-proxy/__pycache__/
 
+# Zig 构建缓存与产物（zeroai-tui）
+zeroai-tui/.zig-cache/
+zeroai-tui/zig-out/
+zeroai-tui/zeroai_tui/zig_render.dll
+zeroai-tui/zeroai_tui/libzig_render.so
+zeroai-tui/zeroai_tui/libzig_render.dylib
+zeroai-tui/zeroai_tui/_renderer*.pyd
+zeroai-tui/zeroai_tui/_terminal*.pyd
+zeroai-tui/zeroai_tui/*.obj
+zeroai-tui/zeroai_tui/*.pdb
+zeroai-tui/zeroai_tui/*.lib
+
 # IDE
 .vscode/
 .idea/

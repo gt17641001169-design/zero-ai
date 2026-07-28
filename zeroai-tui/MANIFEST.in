@@ -1,0 +1,25 @@
+# ZeroAI TUI MANIFEST.in
+# 包含源码和构建产物到 sdist/wheel
+
+# C 源码
+include zeroai_tui/src/_renderer.c
+include zeroai_tui/src/_terminal.c
+
+# Zig 源码和构建脚本
+include build.zig
+include src/zig_render.zig
+
+# 构建脚本
+include setup.py
+
+# Zig 共享库产物（如果构建成功）
+recursive-include zeroai_tui *.dll *.so *.dylib
+
+# 配置文件
+# (pyproject.toml 在项目根目录 d:\C\C\pyproject.toml)
+
+# 测试
+recursive-include tests *.py
+
+# 示例
+recursive-include examples *.py

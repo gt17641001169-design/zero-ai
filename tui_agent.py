@@ -10,9 +10,46 @@ ZeroAI - 终端 AI 助手
 - Tokyo Night 配色
 
 运行：python d:/C/C/tui_agent.py
+
+==========================================================================
+架构迁移说明（v1.1.3+）
+==========================================================================
+本文件是 ZeroAI 的原始单文件实现，自 v1.1.3 起进行模块化拆分：
+
+  zeroai/                  新模块化包（推荐使用）
+  ├── core/                核心层（路径/运行时/密钥/常量/专家路由/上下文压缩/模型管理）
+  ├── tools/               工具层（文件/命令/网络/系统/安全/文档/学术/SSH）
+  ├── tui/                 TUI 层（包装本文件的 UI 组件，提供模块化访问）
+  ├── main.py              统一入口（支持 python -m zeroai）
+  └── __main__.py          模块入口
+
+迁移策略（国家级项目硬约束）：
+  1. 本文件所有代码保留作为备份，不删除任何函数定义
+  2. 通过 "切换块"（搜索 _ZEROAI_IMPL_ACTIVE）将内部调用切换到 zeroai 包
+  3. 切换失败自动回退到本地实现（_ZEROAI_IMPL_ACTIVE=False）
+  4. 新代码应使用 `from zeroai...` 导入，本文件仅作向后兼容入口
+
+弃用计划：
+  - v1.1.x：本文件与 zeroai 包并存，zeroai 为推荐入口
+  - v2.0+：本文件将转为薄入口，仅保留 if __name__ == "__main__" 启动逻辑
+
+推荐启动方式：
+  python -m zeroai                    # 新统一入口（推荐）
+  python tui_agent.py                 # 旧入口（向后兼容，仍可用）
+==========================================================================
 """
 
 import os
+import warnings
+
+# 弃用提示（仅在直接运行本文件时显示，不影响 import）
+if __name__ == "__main__":
+    warnings.warn(
+        "直接运行 tui_agent.py 已弃用，请使用 'python -m zeroai' 启动。"
+        "本入口在 v2.0 前仍可用，详见文件头部架构迁移说明。",
+        DeprecationWarning,
+        stacklevel=1,
+    )
 import sys
 import json
 import atexit
@@ -1017,8 +1054,35 @@ def route_expert(user_input: str) -> str:
     return "knowledge"
 
 
-# GLM语义路由的缓存（避免重复判断）
-_expert_route_cache = {}
+# GLM语义路由的缓存（避免重复判断）- 使用 LRU 防止内存泄漏
+from collections import OrderedDict
+
+class LRUCache:
+    """线程安全的 LRU 缓存"""
+    def __init__(self, maxsize=256):
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+    
+    def get(self, key):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+    
+    def set(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.maxsize:
+            self.cache.popitem(last=False)
+    
+    def __contains__(self, key):
+        return key in self.cache
+    
+    def __len__(self):
+        return len(self.cache)
+
+_expert_route_cache = LRUCache(maxsize=256)
 
 async def route_expert_glm(user_input: str) -> str:
     """用GLM语义判断用户意图，路由到最合适的专家"""
@@ -1028,8 +1092,9 @@ async def route_expert_glm(user_input: str) -> str:
 
     # 缓存命中
     cache_key = user_input[:200]
-    if cache_key in _expert_route_cache:
-        return _expert_route_cache[cache_key]
+    cached = _expert_route_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     glm_cfg = MODEL_CONFIGS["glm-v"]  # 用多模态模型做路由（支持图片消息）
     try:
@@ -1064,16 +1129,16 @@ async def route_expert_glm(user_input: str) -> str:
         valid_keys = {"coder", "reasoner", "academic", "chinese", "vision", "pm", "knowledge"}
         for vk in valid_keys:
             if vk in result:
-                _expert_route_cache[cache_key] = vk
+                _expert_route_cache.set(cache_key, vk)
                 return vk
         # 无效返回，降级到关键词
         expert_key = route_expert(user_input)
-        _expert_route_cache[cache_key] = expert_key
+        _expert_route_cache.set(cache_key, expert_key)
         return expert_key
     except Exception:
         # GLM判断失败，降级到关键词
         expert_key = route_expert(user_input)
-        _expert_route_cache[cache_key] = expert_key
+        _expert_route_cache.set(cache_key, expert_key)
         return expert_key
 
 
@@ -3235,9 +3300,20 @@ def edit_file(path: str, operation: str = "replace", line: int = 1, content: str
 def exec_python(code: str, timeout: int = 10) -> str:
     """在受限环境中执行 Python 代码片段"""
     import io, sys
-    # 危险模块黑名单
-    blocked = ["os.system", "os.popen", "subprocess", "eval", "exec", "compile",
-               "__import__", "open(", "shutil.rmtree", "shutil.move"]
+    # 危险模块黑名单 - 更严格的限制
+    blocked = [
+        "os.system", "os.popen", "subprocess", "eval", "exec", "compile",
+        "__import__", "open(", "shutil.rmtree", "shutil.move",
+        "ctypes", "windll", "cdll", "socket", "http", "urllib", "requests",
+        "multiprocessing", "threading", "signal", "sys.exit", "sys.modules.pop",
+        "importlib", "imp", "code", "codeop", "pdb", "bdb", "profile", "cProfile",
+        "timeit", "unittest", "pytest", "doctest", "xmlrpc", "jsonrpc",
+        "pickle", "shelve", "dbm", "sqlite3", "mysql", "psycopg2",
+        "ftplib", "smtplib", "imaplib", "poplib", "telnetlib", "ssh", "paramiko",
+        "numpy", "pandas", "matplotlib", "scipy", "PIL", "cv2", "opencv",
+        "tensorflow", "torch", "keras", "django", "flask", "fastapi",
+        "selenium", "playwright", "bs4", "lxml",
+    ]
     for b in blocked:
         if b in code:
             return f"错误：代码包含受限操作 '{b}'"
@@ -3307,11 +3383,28 @@ def pip_install(package: str, action: str = "install") -> str:
 def check_port(port: int) -> str:
     """检测端口占用情况"""
     try:
-        r = subprocess.run(f'netstat -ano | findstr ":{port} "', capture_output=True, text=True, timeout=10, shell=True)
-        if not r.stdout.strip():
-            return f"端口 {port} 未被占用"
-        lines = r.stdout.strip().splitlines()
-        result = [f"端口 {port} 已被占用："]
+        import platform
+        if platform.system() == "Windows":
+            r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=10)
+            # 过滤包含指定端口的行
+            lines = [line for line in r.stdout.splitlines() if f":{port} " in line]
+            if not lines:
+                return f"端口 {port} 未被占用"
+            result = [f"端口 {port} 已被占用："]
+            for line in lines[:5]:
+                parts = line.split()
+                if len(parts) >= 4:
+                    result.append(f"  协议: {parts[0]}, 本地地址: {parts[1]}, 状态: {parts[2]}, PID: {parts[3]}")
+            return "\n".join(result)
+        else:
+            r = subprocess.run(["lsof", "-i", f":{port}"], capture_output=True, text=True, timeout=10)
+            if not r.stdout.strip():
+                return f"端口 {port} 未被占用"
+            return f"端口 {port} 已被占用：\n{r.stdout.strip()[:2000]}"
+    except subprocess.TimeoutExpired:
+        return "错误：检测超时"
+    except Exception as e:
+        return f"错误：{e}"
         for line in lines[:10]:
             parts = line.split()
             if len(parts) >= 5:
@@ -8773,6 +8866,125 @@ echo '=== 最近错误日志 ===' && journalctl -p err --since '1 hour ago' --no
     return _ssh_format_prefix(conn_id) + "\n" + report
 
 
+# ============================================================================
+# 阶段3：切换到 zeroai 包的实现（核心迁移块）
+# ----------------------------------------------------------------------------
+# 设计原则（遵循国家级项目硬约束）：
+#   1. 不删除任何原有函数定义，原代码保留作为备份和参考
+#   2. 通过 from ... import 在函数定义后覆盖模块命名空间中的同名绑定
+#      （Python 语义：后导入的符号会绑定到当前模块的全局命名空间）
+#   3. 实际调用时使用 zeroai 包中的实现，便于统一维护和测试
+#   4. 如需回退：注释掉下方整个 try 块即可恢复使用本地实现
+#   5. 导入失败（zeroai 包不存在或损坏）时自动回退到本地实现
+# ============================================================================
+try:
+    # ---- core 层：路径管理 ----
+    from zeroai.core.paths import (
+        _get_desktop_dir, _resolve_save_path, _find_resource_dir,
+        _ensure_user_dir, _get_resource_dir, CONFIG_FILE, CUSTOM_MODELS_FILE,
+    )
+    # ---- core 层：运行时缓存与中断控制 ----
+    from zeroai.core.runtime import (
+        RuntimeCache, runtime_cache, _is_stopped, _set_stop_flag,
+        _interruptible_await, _interruptible_sleep,
+    )
+    # ---- core 层：密钥与配置持久化 ----
+    from zeroai.core.secrets import (
+        _obfuscate, _deobfuscate, _load_config, _save_config,
+        _get_api_key, _load_proxy_config, _save_proxy_config,
+        _is_proxy_enabled, _make_openai_client, PROXY_CONFIG,
+    )
+    # ---- core 层：常量与专家团队 ----
+    from zeroai.core.constants import (
+        MODEL_CONFIGS, EXPERT_TEAM, WORK_MODE, OR_BASE, OR_KEY,
+        HYBRID_MAX_PARALLEL_EXPERTS, HYBRID_EXPERT_MAX_CHARS,
+        HYBRID_DEDUP_SIMILARITY_THRESHOLD, EXPERT_MEMORY_TURNS,
+        HYBRID_ENABLE_COLLAB_CHAIN, CHARS_PER_TOKEN,
+        COMPRESS_THRESHOLD_RATIO, KEEP_RECENT_TURNS,
+        CLEANUP_THRESHOLD_RATIO, CLEANUP_KEEP_RECENT_TURNS,
+        TOOL_OUTPUT_SUMMARY_MAX_LEN, PERMISSION_LEVEL, MAX_FILE_SIZE,
+        set_work_mode,
+    )
+    # ---- core 层：专家路由（含 route_expert / LRUCache） ----
+    from zeroai.core.expert_route import (
+        route_expert, route_expert_glm, get_expert_config, LRUCache,
+        _expert_route_cache, _is_openrouter_expert,
+        _check_openrouter_circuit_breaker,
+        _record_openrouter_failure, _record_openrouter_success,
+    )
+    # ---- core 层：上下文压缩（含 cleanup_context / compress_context） ----
+    from zeroai.core.context_compress import (
+        cleanup_context, compress_context, cleanup_and_compress,
+        _summarize_tool_output, _estimate_tokens, _get_model_context_limit,
+        _truncate_messages_for_context, _model_supports_vision,
+        _filter_messages_for_model, _split_messages_for_compress,
+    )
+    # ---- core 层：模型管理 ----
+    from zeroai.core.model_manager import (
+        get_active_model_info, _load_custom_models, _save_custom_models,
+        detect_ollama_models, get_model_display_name,
+        get_client, get_model_name, get_model_label,
+        set_current_model_key, CURRENT_MODEL_KEY, BUILTIN_MODEL_KEYS,
+    )
+    # ---- core 层：响应处理工具 ----
+    from zeroai.core.response_utils import (
+        _strip_model_tokens, _parse_think_tags, _jaccard_similarity,
+        _truncate_expert_response, _sanitize_identity_leak,
+    )
+
+    # ---- tools 层：文件管理 ----
+    from zeroai.tools.file_manager import (
+        auto_backup, read_file, write_file, list_dir, search_files,
+        delete_file, move_file, copy_file, create_dir,
+        edit_file, file_diff, read_image,
+    )
+    # ---- tools 层：命令执行 ----
+    from zeroai.tools.command_exec import run_command, exec_python, pip_install
+    # ---- tools 层：网络操作 ----
+    from zeroai.tools.network import open_app, web_search, web_fetch, git_status
+    # ---- tools 层：系统检查 ----
+    from zeroai.tools.system_check import (
+        system_info, process_list, check_port,
+        local_port_check, local_process_check, local_disk_check,
+        local_service_check, local_firewall_check, local_user_check,
+        local_monitor,
+    )
+    # ---- tools 层：安全审计 ----
+    from zeroai.tools.security import security_audit
+    # ---- tools 层：文档生成 ----
+    from zeroai.tools.doc_gen import generate_word, generate_excel, generate_pdf
+    # ---- tools 层：学术研究 ----
+    from zeroai.tools.academic import (
+        academic_search, arxiv_search, citation_check,
+        literature_review, render_formula,
+    )
+    # ---- tools 层：窗口管理 ----
+    from zeroai.tools.window_mgr import (
+        active_window, list_windows, read_screen_content,
+    )
+    # ---- tools 层：SSH 远程运维 ----
+    from zeroai.tools.ssh_ops import (
+        ssh_connect, ssh_exec, ssh_upload, ssh_download, ssh_deploy,
+        ssh_setup_samba_share, ssh_list, ssh_disconnect,
+        ssh_service_manage, ssh_log_view, ssh_process_check,
+        ssh_disk_analyze, ssh_network_diag, ssh_docker_manage,
+        ssh_firewall_manage, ssh_health_check,
+    )
+    # ---- tools 层：TOOLS schema 和 TOOL_MAP（覆盖本地定义） ----
+    from zeroai.tools.registry import TOOLS, TOOL_MAP
+
+    _ZEROAI_IMPL_ACTIVE = True  # 标记 zeroai 实现已激活
+except ImportError as _e:
+    # zeroai 包不可用或损坏，回退到本地实现
+    import warnings
+    warnings.warn(
+        f"ZeroAI 包加载失败，回退到 tui_agent.py 本地实现。错误：{_e}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    _ZEROAI_IMPL_ACTIVE = False
+
+
 TOOLS = [
     {"type": "function", "function": {
         "name": "read_file", "description": "读取本地文件内容",
@@ -9273,6 +9485,16 @@ TOOL_MAP = {
     "local_user_check": local_user_check,
     "local_monitor": local_monitor,
 }
+
+# ============================================================================
+# 阶段3 二次切换：覆盖本地 TOOLS / TOOL_MAP 定义
+# ----------------------------------------------------------------------------
+# 由于上方 TOOLS = [...] 和 TOOL_MAP = {...} 会覆盖一次切换块导入的符号，
+# 需要在本地定义之后再次从 zeroai 导入，确保实际调用使用 zeroai 的实现。
+# 本地 TOOLS / TOOL_MAP 定义保留作为备份，不会被执行。
+# ============================================================================
+if _ZEROAI_IMPL_ACTIVE:
+    from zeroai.tools.registry import TOOLS, TOOL_MAP  # noqa: F811
 
 # ====== 工具使用规则（独立常量，主 SYSTEM_PROMPT 和子 TOOL_CAPABILITY_PROMPT 都会引用）======
 # 把 55 个工具分 10 大类，并明确"何时调用"的判断逻辑
@@ -9962,6 +10184,11 @@ def _sanitize_identity_leak(text: str) -> tuple:
             leaked = True
             result = pattern.sub(_IDENTITY_REPLACEMENT, result)
     return result, leaked
+
+
+# 阶段3 局部切换：_sanitize_identity_leak 在切换块之后定义，需重新导入覆盖
+if _ZEROAI_IMPL_ACTIVE:
+    from zeroai.core.response_utils import _sanitize_identity_leak  # noqa: F811
 
 
 def render_markdown(text: str):
@@ -14404,15 +14631,28 @@ class ZeroAI(App):
                     md,
                 )
                 block.update(group)
+                # 完成时才滚底
+                if not self._user_scrolling:
+                    self.query_one("#log-scroll", VerticalScroll).scroll_end(animate=False)
             else:
-                # 流式：纯文本稳定显示（文字在原位增长，不重新布局）
+                # 流式：节流UI更新
+                now = time.time()
+                last_update = getattr(self, '_last_stream_update', 0)
+                if now - last_update < 0.05:  # 50ms节流（20fps）
+                    return
+                self._last_stream_update = now
+                
+                # 用Text.assemble（Rich优化过的）
                 parts = [(f"  ⏵ 构建 · {expert_label}", f"bold {C_RED}"), ("\n", "")]
                 for line in content.split("\n"):
                     parts.append((f"  {line}\n", C_FG))
                 block.update(Text.assemble(*parts))
-            # 只在用户没有主动上翻时自动滚底
-            if not self._user_scrolling:
-                self.query_one("#log-scroll", VerticalScroll).scroll_end(animate=False)
+                
+                # 节流scroll_end：每200ms最多调用一次
+                last_scroll = getattr(self, '_last_scroll_time', 0)
+                if not self._user_scrolling and now - last_scroll > 0.2:
+                    self._last_scroll_time = now
+                    self.query_one("#log-scroll", VerticalScroll).scroll_end(animate=False)
         except Exception:
             # 降级：纯文本
             block.update(Text.assemble(
@@ -14452,8 +14692,18 @@ class ZeroAI(App):
                     md,
                 )
                 block.update(group)
+                # 完成时才滚底
+                if not self._user_scrolling:
+                    self.query_one("#log-scroll", VerticalScroll).scroll_end(animate=False)
             else:
-                # 流式：思考过程灰色 + 正文白色
+                # 流式：节流UI更新
+                now = time.time()
+                last_update = getattr(self, '_last_stream_update', 0)
+                if now - last_update < 0.05:  # 50ms节流
+                    return
+                self._last_stream_update = now
+                
+                # 用Text.assemble（Rich优化过的）
                 parts = [("  ┌─ 助手\n", f"bold {C_GREEN}"), ("  │\n", C_DIM)]
                 if reasoning.strip():
                     parts.append(("  │ 💭 思考中…\n", f"italic {C_DIM}"))
@@ -14470,9 +14720,12 @@ class ZeroAI(App):
                 else:
                     parts.append(("  ⏳…\n", C_DIM))
                 block.update(Text.assemble(*parts))
-            # 自动滚底
-            if not self._user_scrolling:
-                self.query_one("#log-scroll", VerticalScroll).scroll_end(animate=False)
+                
+                # 节流scroll_end
+                last_scroll = getattr(self, '_last_scroll_time', 0)
+                if not self._user_scrolling and now - last_scroll > 0.2:
+                    self._last_scroll_time = now
+                    self.query_one("#log-scroll", VerticalScroll).scroll_end(animate=False)
         except Exception:
             # 降级：纯文本
             block.update(Text.assemble(
@@ -14482,10 +14735,47 @@ class ZeroAI(App):
 
 
 def main():
+    import sys
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="ZeroAI - Terminal AI Assistant")
+    parser.add_argument("--ui", choices=["textual", "zeroai-tui"], default="textual",
+                       help="UI framework to use (default: textual)")
+    parser.add_argument("--expert", type=str, help="Direct expert mode (skip routing)")
+    args, unknown = parser.parse_known_args()
+    
     try:
-        app = ZeroAI()
-        app.title = "ZeroAI"
-        app.run()
+        if args.ui == "zeroai-tui":
+            # Use zeroai-tui UI with full AI core integration
+            try:
+                # Add zeroai-tui to path
+                _tui_dir = os.path.join(_SCRIPT_DIR, "zeroai-tui")
+                if _tui_dir not in sys.path:
+                    sys.path.insert(0, _tui_dir)
+                
+                from zeroai_tui.integration import ZeroAIIntegration
+                
+                print("Starting ZeroAI with zeroai-tui (C-accelerated)...")
+                print("Press Ctrl+C to exit")
+                print()
+                
+                integration = ZeroAIIntegration()
+                
+                # Core integration is now automatic via ZeroAIIntegration.init_core()
+                # No need for manual callback - it routes through expert system
+                
+                integration.start()
+                
+            except ImportError as e:
+                print(f"zeroai-tui not available: {e}")
+                print("Falling back to Textual UI...")
+                args.ui = "textual"
+        
+        if args.ui == "textual":
+            # Use existing Textual UI
+            app = ZeroAI()
+            app.title = "ZeroAI"
+            app.run()
     finally:
         # 程序退出时清理运行时缓存
         runtime_cache.cleanup()

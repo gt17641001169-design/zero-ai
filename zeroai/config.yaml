@@ -1,0 +1,337 @@
+# ZeroAI Configuration File
+# This file contains all configurable settings for ZeroAI
+
+# ====== Model Configurations ======
+models:
+  glm:
+    label: "智谱GLM"
+    base_url: "https://open.bigmodel.cn/api/paas/v4/"
+    api_key: ""  # Will be loaded from environment or config
+    model: "glm-4.7-flash"
+  
+  glm-4:
+    label: "智谱GLM-4"
+    base_url: "https://open.bigmodel.cn/api/paas/v4/"
+    api_key: ""  # Will be loaded from environment or config
+    model: "glm-4-flash"
+  
+  glm-v:
+    label: "智谱GLM-4V"
+    base_url: "https://open.bigmodel.cn/api/paas/v4/"
+    api_key: ""  # Will be loaded from environment or config
+    model: "glm-4v-flash"
+  
+  openrouter:
+    label: "OpenRouter"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: ""  # Will be loaded from environment or config
+    model: "openrouter/free"
+  
+  ollama:
+    label: "Ollama本地"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    model: "gemma4:latest"
+
+# ====== Expert Team Configuration ======
+experts:
+  pm:
+    label: "项目经理·GLM-4V"
+    model_key: "glm-v"
+    model: "glm-4v-flash"
+    desc: "任务分析·调度·多模态（支持图片）"
+    keywords:
+      - "帮助"
+      - "分析"
+      - "计划"
+      - "总结"
+      - "翻译"
+      - "什么"
+      - "怎么"
+      - "如何"
+      - "介绍"
+      - "解释"
+    system_prompt: "你是 ZeroAI 的项目经理，负责任务分析、计划制定、跨领域调度。用中文回答，简洁明了。如用户发送图片，请理解图片内容并纳入分析。"
+  
+  coder:
+    label: "编程·GLM-4.7"
+    model_key: "glm"
+    model: "glm-4.7-flash"
+    desc: "代码生成·调试·重构（GLM-4.7-Flash·智谱直供·免费无限）"
+    keywords:
+      - "代码"
+      - "编程"
+      - "函数"
+      - "bug"
+      - "error"
+      - "python"
+      - "js"
+      - "java"
+      - "css"
+      - "html"
+      - "sql"
+      - "api"
+      - "写一个"
+      - "实现"
+      - "debug"
+      - "code"
+      - "function"
+      - "class"
+      - "脚本"
+    system_prompt: "你是 ZeroAI 的编程专家，专精代码生成、调试、重构、架构设计。直接给出可运行的代码，必要时简短说明思路。你是 ZeroAI，不是其他模型。"
+  
+  reasoner:
+    label: "推理·GLM-4.7"
+    model_key: "glm"
+    model: "glm-4.7-flash"
+    desc: "深度推理·数学·逻辑（GLM-4.7-Flash·智谱直供·免费无限）"
+    keywords:
+      - "推理"
+      - "证明"
+      - "数学"
+      - "计算"
+      - "逻辑"
+      - "为什么"
+      - "分析原因"
+      - "算法"
+      - "复杂"
+      - "优化"
+      - "证明"
+      - "solve"
+      - "math"
+      - "reason"
+    system_prompt: "你是 ZeroAI 的推理专家，专精深度推理、数学证明、复杂逻辑分析。给出严谨的推理过程和结论。你是 ZeroAI，不是其他模型。"
+  
+  academic:
+    label: "学术·GLM-4.7"
+    model_key: "glm"
+    model: "glm-4.7-flash"
+    desc: "学术论文·文献综述·研究方法·LaTeX"
+    keywords:
+      - "论文"
+      - "文献"
+      - "学术"
+      - "研究"
+      - "综述"
+      - "引用"
+      - "期刊"
+      - "会议"
+      - "arxiv"
+      - "paper"
+      - "academic"
+      - "research"
+      - "review"
+      - "LaTeX"
+      - "公式"
+      - "定理"
+      - "证明"
+    system_prompt: "你是 ZeroAI 的学术专家，专精论文写作、文献综述、研究方法、LaTeX公式。遵循学术规范，给出严谨的学术内容。你是 ZeroAI，不是其他模型。"
+  
+  chinese:
+    label: "中文·GLM-4.7"
+    model_key: "glm"
+    model: "glm-4.7-flash"
+    desc: "中文写作·文章·报告·文案·邮件"
+    keywords:
+      - "中文"
+      - "写作"
+      - "文章"
+      - "报告"
+      - "文案"
+      - "邮件"
+      - "总结"
+      - "翻译"
+      - "润色"
+      - "修改"
+      - "作文"
+      - "写作"
+    system_prompt: "你是 ZeroAI 的中文写作专家，专精中文文章、报告、文案、邮件写作。给出流畅、地道的中文内容。你是 ZeroAI，不是其他模型。"
+  
+  vision:
+    label: "视觉·GLM-4V"
+    model_key: "glm-v"
+    model: "glm-4v-flash"
+    desc: "图片理解·截图分析·视觉"
+    keywords:
+      - "图片"
+      - "截图"
+      - "视觉"
+      - "看"
+      - "图像"
+      - "照片"
+      - "图像"
+      - "visual"
+      - "image"
+      - "screenshot"
+    system_prompt: "你是 ZeroAI 的视觉专家，专精图片理解、截图分析、视觉内容解读。仔细观察图片内容，给出准确的描述和分析。你是 ZeroAI，不是其他模型。"
+  
+  knowledge:
+    label: "知识·GLM-4.7"
+    model_key: "glm"
+    model: "glm-4.7-flash"
+    desc: "百科知识·事实查询·翻译·其他"
+    keywords:
+      - "知识"
+      - "百科"
+      - "事实"
+      - "历史"
+      - "地理"
+      - "科学"
+      - "常识"
+      - "是什么"
+      - "谁是"
+      - "什么时候"
+      - "哪里"
+    system_prompt: "你是 ZeroAI 的知识专家，专精百科知识、事实查询、常识解答。给出准确、简洁的知识性回答。你是 ZeroAI，不是其他模型。"
+  
+  devops:
+    label: "运维·GLM-4.7"
+    model_key: "glm"
+    model: "glm-4.7-flash"
+    desc: "DevOps运维·系统管理·SSH·容器·部署·监控"
+    keywords:
+      - "运维"
+      - "部署"
+      - "服务器"
+      - "linux"
+      - "windows"
+      - "docker"
+      - "容器"
+      - "kubernetes"
+      - "k8s"
+      - "ssh"
+      - "shell"
+      - "bash"
+      - "powershell"
+      - "nginx"
+      - "apache"
+      - "systemd"
+      - "服务"
+      - "进程"
+      - "端口"
+      - "防火墙"
+      - "监控"
+      - "日志"
+      - "性能"
+      - "调优"
+      - "devops"
+      - "ci/cd"
+      - "jenkins"
+      - "ansible"
+      - "terraform"
+      - "负载均衡"
+    system_prompt: "你是 ZeroAI 的运维专家，专精 DevOps、系统管理、容器编排、CI/CD、监控告警、性能调优。给出可执行的命令和配置，必要时说明原理。优先使用项目内置的运维工具（local_port_check/local_process_check/local_disk_check/local_service_check/local_firewall_check/ssh_*）而非直接给命令。你是 ZeroAI，不是其他模型。"
+  
+  security:
+    label: "安全·GLM-4.7"
+    model_key: "glm"
+    model: "glm-4.7-flash"
+    desc: "安全分析·漏洞评估·加固方案·安全审计"
+    keywords:
+      - "安全"
+      - "漏洞"
+      - "攻击"
+      - "防护"
+      - "加固"
+      - "审计"
+      - "渗透"
+      - "xss"
+      - "sql注入"
+      - "csrf"
+      - "ssrf"
+      - "rce"
+      - "漏洞"
+      - "cve"
+      - "加密"
+      - "证书"
+      - "ssl"
+      - "tls"
+      - "密钥"
+      - "token"
+      - "权限"
+      - "认证"
+      - "授权"
+      - "owasp"
+      - "waf"
+      - "防火墙规则"
+      - "入侵检测"
+      - "security"
+      - "vulnerability"
+      - "pentest"
+      - "hardening"
+    system_prompt: "你是 ZeroAI 的安全专家，专精漏洞分析、安全加固、审计评估、加密方案。只做防御性安全分析，不提供攻击性建议。给出具体的加固命令、配置示例、修复方案。你是 ZeroAI，不是其他模型。"
+  
+  data:
+    label: "数据·GLM-4.7"
+    model_key: "glm"
+    model: "glm-4.7-flash"
+    desc: "数据分析·统计建模·可视化·数据清洗"
+    keywords:
+      - "数据"
+      - "分析"
+      - "统计"
+      - "可视化"
+      - "图表"
+      - "pandas"
+      - "numpy"
+      - "matplotlib"
+      - "数据清洗"
+      - "数据预处理"
+      - "特征工程"
+      - "机器学习"
+      - "数据挖掘"
+      - "报表"
+      - "数据看板"
+      - "excel"
+      - "csv"
+      - "json"
+      - "sql查询"
+      - "数据分析"
+      - "dataframe"
+      - "bi"
+      - "回归"
+      - "聚类"
+      - "分类"
+      - "data"
+      - "analytics"
+    system_prompt: "你是 ZeroAI 的数据分析专家，专精数据清洗、统计分析、可视化、机器学习建模。给出可运行的 Python 代码（pandas/numpy/matplotlib/sklearn），必要时说明分析思路。你是 ZeroAI，不是其他模型。"
+
+# ====== Hybrid Mode Configuration ======
+hybrid:
+  max_parallel_experts: 3
+  expert_max_chars: 800
+  dedup_similarity_threshold: 0.7
+  memory_turns: 3
+  enable_collab_chain: false
+
+# ====== Tool Configuration ======
+tools:
+  max_result_length: 8000
+  timeout: 120
+  python_sandbox_timeout: 10
+
+# ====== TUI Configuration ======
+tui:
+  theme: "dark"
+  font_size: 14
+  show_toolbar: true
+  auto_scroll: true
+
+# ====== Security Configuration ======
+security:
+  allowed_commands:
+    - "dir"
+    - "ls"
+    - "pwd"
+    - "echo"
+    - "cat"
+    - "type"
+    - "find"
+    - "grep"
+  blocked_commands:
+    - "format"
+    - "del /f"
+    - "shutdown"
+    - "mkfs"
+    - "rm -rf /"
+  max_output_length: 8000
