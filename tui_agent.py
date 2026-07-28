@@ -12594,6 +12594,10 @@ class ZeroAI(App):
         self._tts_rate = "+0%"  # 默认语速
         self._is_listening = False  # ASR 录音中状态
         self._voice_dialog_active = False  # 语音对话模式（保留兼容字段）
+        # ReAct Agent 模式（/react 切换）：启用后走 观察-思考-行动 循环
+        self.react_enabled = False
+        # RAG 检索器（/索引 命令构建后自动启用）
+        self._retriever = None
 
     def get_current_client(self):
         """获取当前模型的客户端"""
@@ -13504,6 +13508,85 @@ class ZeroAI(App):
             ))
             self.query_one("#input", MessageInput).value = ""
             return
+        if user_input in ("/react", "/智能体"):
+            # 切换 ReAct Agent 模式
+            self.react_enabled = not self.react_enabled
+            status = "开启" if self.react_enabled else "关闭"
+            self._add_static(Text.assemble(
+                ("  ReAct Agent 模式已", C_DIM),
+                (f"{status}", f"bold {C_FG}"),
+                ("\n", ""),
+                ("  观察→思考→行动 循环，支持自我纠错和 RAG 检索\n", C_DIM) if self.react_enabled else ("  已回退到普通工具调用模式\n", C_DIM),
+            ))
+            self.query_one("#input", MessageInput).value = ""
+            return
+        if user_input in ("/index", "/索引"):
+            # 构建项目向量索引
+            self._add_static(Text.assemble(
+                ("  正在构建项目向量索引…\n", f"bold {C_FG}"),
+            ))
+            try:
+                import asyncio as _asyncio
+                from zeroai.memory import index_project, get_retriever
+
+                project_root = os.getcwd()
+                progress_block = self._add_block("索引进度", C_DIM)
+                progress_block.update(Text.assemble(
+                    (f"  扫描 {project_root} …\n", C_DIM),
+                ))
+
+                def _on_progress(current, total, fpath):
+                    if current % 10 == 0 or current == total:
+                        progress_block.update(Text.assemble(
+                            (f"  索引中 {current}/{total}：{os.path.basename(fpath)}\n", C_DIM),
+                        ))
+
+                stats = _asyncio.get_event_loop().run_until_complete(
+                    index_project(project_root, on_progress=_on_progress)
+                )
+                self._retriever = get_retriever()
+                self._add_static(Text.assemble(
+                    ("  └─ 索引完成：", C_DIM),
+                    (f"{stats['indexed_files']} 文件 / {stats['total_chunks']} 块", f"bold {C_FG}"),
+                    (f" / {stats['elapsed']:.1f}s\n", C_DIM),
+                ))
+            except Exception as e:
+                self._add_static(Text.assemble(
+                    ("  └─ 索引失败：", C_DIM),
+                    (f"{e}\n", f"bold {C_YELLOW}"),
+                ))
+            self.query_one("#input", MessageInput).value = ""
+            return
+        if user_input in ("/memory", "/记忆"):
+            # 查看向量记忆统计
+            try:
+                from zeroai.memory import get_retriever
+                retriever = get_retriever()
+                stats = retriever.get_stats()
+                if stats["total_chunks"] == 0:
+                    self._add_static(Text.assemble(
+                        ("  向量记忆为空，输入 ", C_DIM),
+                        ("/索引", f"bold {C_FG}"),
+                        (" 构建项目索引\n", C_DIM),
+                    ))
+                else:
+                    by_source = stats.get("by_source", {})
+                    top_sources = sorted(by_source.items(), key=lambda x: -x[1])[:5]
+                    sources_text = " | ".join(f"{s}:{c}" for s, c in top_sources)
+                    self._add_static(Text.assemble(
+                        ("  向量记忆统计\n", f"bold {C_FG}"),
+                        (f"  总块数：{stats['total_chunks']}\n", C_DIM),
+                        (f"  文件数：{stats['total_sources']}\n", C_DIM),
+                        (f"  向量维度：{stats['vector_dim']}\n", C_DIM),
+                        (f"  Top 文件：{sources_text}\n", C_DIM),
+                    ))
+            except Exception as e:
+                self._add_static(Text.assemble(
+                    ("  └─ 查询失败：", C_DIM),
+                    (f"{e}\n", f"bold {C_YELLOW}"),
+                ))
+            self.query_one("#input", MessageInput).value = ""
+            return
         if user_input in ("/model", "/模型"):
             # 显示当前模型和可用模型
             mode_label = {"expert": "专家模式", "hybrid": "混合思考", "manual": "手动模式"}.get(self.work_mode, "未知")
@@ -13651,6 +13734,9 @@ class ZeroAI(App):
             ("    /专家          切换到专家模式（自动路由）\n", C_FG),
             ("    /混合          切换到混合思考（多专家协作）\n", C_FG),
             ("    /手动          切换到手动模式（指定模型）\n", C_FG),
+            ("    /智能体        切换 ReAct Agent 模式（观察→思考→行动）\n", C_FG),
+            ("    /索引          构建项目向量索引（启用 RAG 检索）\n", C_FG),
+            ("    /记忆          查看向量记忆统计\n", C_FG),
             ("    /模型          查看当前模型和专家团队\n", C_FG),
             ("    /模型 glm      切换到智谱GLM（手动模式）\n", C_FG),
             ("    /模型 glm-v    切换到智谱GLM-4V（多模态，支持图片）\n", C_FG),
@@ -14152,6 +14238,11 @@ class ZeroAI(App):
 
     async def _run_turn(self):
         """执行 Agent 循环 - 流式 + Markdown 渲染（实时更新）"""
+        # ── ReAct Agent 模式：走 观察-思考-行动 循环 ──
+        if self.react_enabled:
+            await self._run_react_turn()
+            return
+
         # ── 安全策略：hybrid 模式下若请求需要调用工具，强制降级到 expert 模式 ──
         # hybrid 子代理目前不传递 tools 参数，无法执行真正的 function_calling；
         # 检测到工具类请求时自动切换到 expert 模式，避免模型输出 <tool_call> 伪 XML。
@@ -14181,6 +14272,128 @@ class ZeroAI(App):
         finally:
             if _original_work_mode is not None:
                 self.work_mode = _original_work_mode
+
+    async def _run_react_turn(self):
+        """ReAct Agent 模式：观察→思考→行动 循环
+
+        复用 zeroai.core.agent.AgentLoop，通过回调更新 TUI 显示。
+        """
+        self._is_generating = True
+        self._stop_generation = False
+        global _GLOBAL_STOP
+        _GLOBAL_STOP = False
+
+        try:
+            from zeroai.core.agent import AgentLoop, ReActPlanner
+            from zeroai.memory import get_retriever
+
+            # 提取最后一条用户消息
+            user_input = ""
+            for msg in reversed(self.messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        user_input = " ".join(
+                            p.get("text", "") for p in content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                    else:
+                        user_input = str(content)
+                    break
+
+            if not user_input:
+                self._add_static(Text("  └─ 无用户输入\n", style=C_DIM))
+                return
+
+            # API Key 检查
+            cur_key = MODEL_CONFIGS.get(self.model_key, {}).get("api_key", "")
+            if not cur_key:
+                self._add_static(Text.assemble(
+                    (f"  {_load_svg_icon('warning')} 未配置 API 密钥\n", f"bold {C_FG}"),
+                    (f"  ReAct Agent 需要调用 LLM 规划器，请先配置 API Key\n", C_DIM),
+                ))
+                return
+
+            # 获取 RAG 检索器（如果已索引）
+            retriever = None
+            try:
+                r = get_retriever()
+                if r.get_stats()["total_chunks"] > 0:
+                    retriever = r
+            except Exception:
+                pass
+
+            # 创建 AgentLoop
+            planner = ReActPlanner(model_key=self.model_key)
+            loop = AgentLoop(
+                planner=planner,
+                max_steps=self.max_turns,
+                retriever=retriever,
+            )
+
+            # 注册回调：更新 TUI 显示
+            async def _on_thought(text):
+                block = self._add_block("思考", C_CYAN)
+                block.update(Text.assemble(
+                    (f"  {_load_svg_icon('search')} {text}\n", f"bold {C_CYAN}"),
+                ))
+
+            async def _on_tool_call(name, args):
+                import json as _json
+                tool_info = f"**调用工具** `{name}`\n\n```json\n{_json.dumps(args, ensure_ascii=False, indent=2)}\n```"
+                self._add_static(_safe_markdown(tool_info, code_theme="monokai"))
+
+            async def _on_tool_result(name, result):
+                result_md = f"**结果**\n\n{result[:2000]}"
+                self._add_static(_safe_markdown(result_md, code_theme="monokai"))
+                self._add_static(Text("  └─", style=C_DIM))
+
+            async def _on_final_answer(answer):
+                if answer.strip():
+                    self._last_reply_text = answer
+                    self.messages.append({"role": "assistant", "content": answer})
+                    self._add_static(_safe_markdown(answer, code_theme="monokai"))
+
+            async def _on_error(text):
+                self._add_static(Text.assemble(
+                    (f"  └─ 错误：{text}\n", f"bold {C_YELLOW}"),
+                ))
+
+            loop.on_thought = _on_thought
+            loop.on_tool_call = _on_tool_call
+            loop.on_tool_result = _on_tool_result
+            loop.on_final_answer = _on_final_answer
+            loop.on_error = _on_error
+            loop.is_stopped = lambda: self._stop_generation
+
+            # 标记开始
+            block_start = self._add_block("ReAct Agent", C_PURPLE)
+            block_start.update(Text.assemble(
+                (f"  ⏵ ReAct Agent 启动\n", f"bold {C_PURPLE}"),
+                (f"  │ 观察→思考→行动循环（最多 {self.max_turns} 步）\n", C_DIM),
+                (f"  │ RAG 检索：{'已启用' if retriever else '未启用'}\n", C_DIM),
+            ))
+
+            # 运行 Agent 循环
+            final_answer, steps = await loop.run(
+                user_input=user_input,
+                messages=self.messages,
+            )
+
+            # 显示步数统计
+            tool_count = sum(1 for s in steps if s.get("action_type") == "tool_call")
+            self._add_static(Text.assemble(
+                ("  └─ ", C_DIM),
+                (f"ReAct 完成：{len(steps)} 步 / {tool_count} 次工具调用\n", C_DIM),
+            ))
+
+        except Exception as e:
+            self._add_static(Text.assemble(
+                ("  └─ ReAct Agent 错误：", C_DIM),
+                (f"{e}\n", f"bold {C_YELLOW}"),
+            ))
+        finally:
+            self._is_generating = False
 
     async def _run_turn_impl(self):
         """_run_turn 的实际实现（被 _run_turn 包装以处理模式降级恢复）"""

@@ -154,6 +154,15 @@ from .response_utils import (
     _sanitize_identity_leak,
 )
 
+# ReAct Agent（观察-思考-行动循环）
+from .agent import (
+    ReActPlanner,
+    AgentLoop,
+    PLANNER_SYSTEM_PROMPT,
+    get_agent_loop,
+    reset_agent_loop,
+)
+
 __all__ = [
     # 原有模块
     "get_config", "load_config",
@@ -202,4 +211,7 @@ __all__ = [
     # 响应处理
     "_strip_model_tokens", "_parse_think_tags", "_jaccard_similarity",
     "_truncate_expert_response", "_sanitize_identity_leak",
+    # ReAct Agent
+    "ReActPlanner", "AgentLoop", "PLANNER_SYSTEM_PROMPT",
+    "get_agent_loop", "reset_agent_loop",
 ]
