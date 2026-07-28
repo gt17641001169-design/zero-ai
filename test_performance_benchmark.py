@@ -22,7 +22,8 @@ import time
 import statistics
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "zeroai-tui"))
+sys.path.insert(0, os.path.dirname(__file__))
 
 # 检测可用的渲染后端
 HAS_ZIG_RENDERER = False

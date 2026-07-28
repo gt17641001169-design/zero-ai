@@ -93,6 +93,7 @@ class ReActPlanner:
         model_key: str = "glm",
         temperature: float = 0.2,
         max_tokens: int = 800,
+        system_prompt: Optional[str] = None,
     ):
         """初始化规划器
 
@@ -101,10 +102,14 @@ class ReActPlanner:
             model_key: 模型标识（llm 为 None 时生效）
             temperature: 低温度保证规划稳定性
             max_tokens: 规划输出 token 上限
+            system_prompt: 自定义系统提示词（阶段 K.4）
+                           为 None 时使用默认 PLANNER_SYSTEM_PROMPT
+                           MultiAgentCollaborator 可为不同角色注入不同 prompt
         """
         self.llm = llm or LLMClient(model_key)
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.system_prompt = system_prompt
         self._tools_summary_cache: Optional[str] = None
         self._tools_cache_key: Optional[str] = None
 
@@ -229,7 +234,7 @@ class ReActPlanner:
 
         try:
             response = await self.llm.chat(
-                system_prompt=PLANNER_SYSTEM_PROMPT,
+                system_prompt=self.system_prompt or PLANNER_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -351,6 +356,9 @@ class AgentLoop:
         tools_schema: Optional[List[Dict[str, Any]]] = None,
         max_steps: int = 8,
         retriever: Optional[Callable[[str], List[str]]] = None,
+        use_mcp: bool = False,
+        enable_audit: bool = True,
+        enable_mcp_health_check: bool = False,
     ):
         """初始化 Agent Loop
 
@@ -360,6 +368,13 @@ class AgentLoop:
             tools_schema: 工具 schema 列表，为 None 时从 registry 导入
             max_steps: 单轮对话最大步数
             retriever: RAG 检索函数
+            use_mcp: 是否启用 MCP 生态统一调度（阶段 J.1）
+                     启用后工具调用走 MCPEcosystemManager.call_tool，
+                     自动获得冲突重命名解析与 MCP 优先调度能力
+            enable_audit: 是否启用工具调用审计日志（阶段 J.2）
+                          启用后所有工具调用自动记录到 MCPAuditLogger
+            enable_mcp_health_check: 是否启用 MCP 健康检查（阶段 J.3）
+                                     启用后 MCP 工具调用前先检查服务器健康状态
         """
         self.planner = planner or ReActPlanner()
         if tool_map is None or tools_schema is None:
@@ -371,6 +386,11 @@ class AgentLoop:
             self.tools_schema = tools_schema
         self.max_steps = max_steps
         self.retriever = retriever
+
+        # 阶段 J：MCP 生态集成开关
+        self.use_mcp = use_mcp
+        self.enable_audit = enable_audit
+        self.enable_mcp_health_check = enable_mcp_health_check
 
         # 回调钩子（UI 层注册）
         self.on_thought: Optional[Callable[[str], Awaitable[None]]] = None
@@ -393,9 +413,81 @@ class AgentLoop:
         """执行工具调用，返回结果字符串
 
         自动过滤模型幻觉的无效参数。
+        阶段 J：支持 MCP 生态统一调度、审计日志、健康检查。
         """
+        import time as _time
+
+        start_ts = _time.time()
+        success = False
+        error_msg = ""
+        result_str = ""
+
+        # 阶段 J.1：MCP 生态统一调度
+        if self.use_mcp:
+            try:
+                from zeroai.mcp.ecosystem import get_ecosystem_manager
+                from zeroai.mcp.registry import parse_mcp_tool_name
+
+                eco = get_ecosystem_manager()
+
+                # 阶段 J.3：MCP 工具健康检查
+                if self.enable_mcp_health_check:
+                    mcp_info = parse_mcp_tool_name(name)
+                    if mcp_info:
+                        server_name, _ = mcp_info
+                        try:
+                            from zeroai.mcp.health import get_health_monitor
+                            monitor = get_health_monitor()
+                            record = monitor.get_record(server_name)
+                            if record.is_degraded:
+                                result_str = f"[降级] MCP 服务器 {server_name} 当前处于降级状态，跳过调用"
+                                success = False
+                                error_msg = result_str
+                                # 审计记录
+                                if self.enable_audit:
+                                    self._record_audit(
+                                        server_name=server_name,
+                                        tool_name=name,
+                                        arguments=args,
+                                        success=False,
+                                        duration=_time.time() - start_ts,
+                                        error_message=error_msg,
+                                    )
+                                return result_str
+                        except Exception:
+                            pass  # 健康检查失败不阻断主流程
+
+                # 通过生态管理器调度
+                result_str = await eco.call_tool(name, args)
+                success = not result_str.startswith("[错误]") and not result_str.startswith("[降级]")
+
+                # 审计记录
+                if self.enable_audit:
+                    mcp_info = parse_mcp_tool_name(name)
+                    server_name = mcp_info[0] if mcp_info else "builtin"
+                    self._record_audit(
+                        server_name=server_name,
+                        tool_name=name,
+                        arguments=args,
+                        success=success,
+                        duration=_time.time() - start_ts,
+                        error_message="" if success else result_str,
+                        result_preview=result_str[:200] if result_str else "",
+                    )
+
+                return result_str
+            except Exception as e:
+                # MCP 调度失败，回退到本地 tool_map
+                result_str = f"[MCP 调度错误] {type(e).__name__}: {e}"
+                error_msg = result_str
+                # 不直接返回，继续走本地 tool_map 作为兜底
+
+        # 本地 tool_map 调用（原有逻辑，保持兼容）
         fn = self.tool_map.get(name)
         if fn is None:
+            # 如果 MCP 调度已产生错误信息，附加返回
+            if result_str.startswith("[MCP 调度错误]"):
+                return f"{result_str}\n[错误] 本地工具也未找到: {name}"
             return f"[错误] 未知工具: {name}"
 
         # 过滤无效参数
@@ -416,11 +508,76 @@ class AgentLoop:
             result_str = str(result)
             if extra:
                 result_str += f"\n[提示：忽略多余参数 {extra}]"
+            success = True
+
+            # 阶段 J.2：审计日志记录
+            if self.enable_audit:
+                self._record_audit(
+                    server_name="builtin",
+                    tool_name=name,
+                    arguments=args,
+                    success=True,
+                    duration=_time.time() - start_ts,
+                    result_preview=result_str[:200] if result_str else "",
+                )
+
             return result_str
         except TypeError as e:
-            return f"[参数错误] {e}"
+            error_msg = f"[参数错误] {e}"
+            if self.enable_audit:
+                self._record_audit(
+                    server_name="builtin",
+                    tool_name=name,
+                    arguments=args,
+                    success=False,
+                    duration=_time.time() - start_ts,
+                    error_message=error_msg,
+                )
+            return error_msg
         except Exception as e:
-            return f"[执行错误] {type(e).__name__}: {e}"
+            error_msg = f"[执行错误] {type(e).__name__}: {e}"
+            if self.enable_audit:
+                self._record_audit(
+                    server_name="builtin",
+                    tool_name=name,
+                    arguments=args,
+                    success=False,
+                    duration=_time.time() - start_ts,
+                    error_message=error_msg,
+                )
+            return error_msg
+
+    def _record_audit(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        success: bool,
+        duration: float,
+        error_message: str = "",
+        result_preview: str = "",
+    ) -> None:
+        """记录工具调用审计日志（阶段 J.2）
+
+        延迟导入避免循环依赖，审计失败不阻断主流程。
+        """
+        try:
+            from zeroai.mcp.audit import get_audit_logger
+            logger = get_audit_logger()
+            logger.record(
+                server_name=server_name,
+                tool_name=tool_name,
+                full_tool_name=tool_name,
+                arguments=arguments,
+                success=success,
+                duration=duration,
+                result_length=len(result_preview) if result_preview else 0,
+                error_message=error_message,
+                result_preview=result_preview,
+                caller="agent_loop",
+            )
+        except Exception:
+            pass  # 审计记录失败不阻断主流程
 
     async def run(
         self,
@@ -1184,6 +1341,10 @@ class AdvancedAgentLoop(AgentLoop):
         reflexion_engine: Optional[ReflexionEngine] = None,
         summarizer: Optional[ToolResultSummarizer] = None,
         plan_planner: Optional[PlanAndExecutePlanner] = None,
+        # 阶段 J：MCP 生态集成参数
+        use_mcp: bool = False,
+        enable_audit: bool = True,
+        enable_mcp_health_check: bool = False,
     ):
         """初始化增强版 Agent Loop
 
@@ -1197,6 +1358,9 @@ class AdvancedAgentLoop(AgentLoop):
             reflexion_engine: 自定义反思引擎
             summarizer: 自定义摘要器
             plan_planner: 自定义多步规划器
+            use_mcp: 启用 MCP 生态统一调度（阶段 J.1）
+            enable_audit: 启用工具调用审计日志（阶段 J.2）
+            enable_mcp_health_check: 启用 MCP 健康检查（阶段 J.3）
         """
         super().__init__(
             planner=planner,
@@ -1204,6 +1368,9 @@ class AdvancedAgentLoop(AgentLoop):
             tools_schema=tools_schema,
             max_steps=max_steps,
             retriever=retriever,
+            use_mcp=use_mcp,
+            enable_audit=enable_audit,
+            enable_mcp_health_check=enable_mcp_health_check,
         )
         self.enable_plan = enable_plan
         self.enable_reflexion = enable_reflexion
@@ -1887,9 +2054,11 @@ class MultiAgentCollaborator:
             tools_schema = list(TOOLS)
             tool_map = dict(TOOL_MAP)
 
-        # 创建 Agent Loop
-        planner = ReActPlanner(model_key=role.model_key)
-        planner.system_prompt = role.system_prompt  # 注入角色 prompt
+        # 创建 Agent Loop（阶段 K.4：通过构造函数注入角色 prompt）
+        planner = ReActPlanner(
+            model_key=role.model_key,
+            system_prompt=role.system_prompt,
+        )
 
         loop = AdvancedAgentLoop(
             planner=planner,

@@ -153,6 +153,70 @@ _zig_built = build_zig_library()
 # ============================================================================
 # 第2步：定义 C 扩展
 # ============================================================================
+
+# 检测 Python 头文件版本是否匹配
+# 如果 TRAE 等嵌入式环境的头文件版本与实际 Python 版本不一致，
+# 可通过环境变量 ZEROAI_PYTHON_INCLUDE_DIR 指定匹配的头文件目录
+import sysconfig
+
+def _get_python_include_dirs():
+    """获取 Python 头文件目录，支持版本匹配覆盖"""
+    default_inc = sysconfig.get_path('include')
+    env_inc = os.environ.get('ZEROAI_PYTHON_INCLUDE_DIR')
+    if env_inc and os.path.isdir(env_inc):
+        # 验证头文件版本
+        patchlevel = os.path.join(env_inc, 'patchlevel.h')
+        if os.path.exists(patchlevel):
+            try:
+                with open(patchlevel, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if 'PY_VERSION' in line and '"' in line:
+                            ver = line.split('"')[1]
+                            actual_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+                            if ver == actual_ver:
+                                print(f"[setup] Using matched Python headers: {env_inc} (v{ver})")
+                                return [env_inc]
+                            else:
+                                print(f"[setup] WARNING: Header version {ver} != Python {actual_ver}")
+                                break
+            except Exception:
+                pass
+    return [default_inc]
+
+def _get_python_library_dirs():
+    """获取 Python 库文件目录"""
+    default_lib = sysconfig.get_config_var('LIBDIR') or os.path.join(sys.prefix, 'libs')
+    env_lib = os.environ.get('ZEROAI_PYTHON_LIB_DIR')
+    if env_lib and os.path.isdir(env_lib):
+        return [env_lib, default_lib]
+    return [default_lib]
+
+def _get_python_libraries():
+    """获取要链接的 Python 库列表
+
+    在 TRAE 等嵌入式环境中，默认的 python3.lib 可能指向错误版本的 DLL
+    （如 python312.dll 而非 python310.dll）。此时通过环境变量
+    ZEROAI_PYTHON_LIB_DIR 指定包含正确 python310.lib 的目录，
+    并强制链接 python310.lib。
+    """
+    if os.name == 'nt':
+        env_lib = os.environ.get('ZEROAI_PYTHON_LIB_DIR')
+        if env_lib and os.path.isdir(env_lib):
+            # 检查是否存在 python310.lib（或对应版本的 lib）
+            py_ver_nodot = f"{sys.version_info.major}{sys.version_info.minor}"
+            candidate_lib = os.path.join(env_lib, f"python{py_ver_nodot}.lib")
+            if os.path.exists(candidate_lib):
+                print(f"[setup] Using matched Python library: python{py_ver_nodot}.lib")
+                return [f"python{py_ver_nodot}"]
+    return None  # None 表示使用默认行为
+
+include_dirs = _get_python_include_dirs()
+library_dirs = _get_python_library_dirs()
+libraries = _get_python_libraries()
+print(f"[setup] include_dirs: {include_dirs}")
+print(f"[setup] library_dirs: {library_dirs}")
+print(f"[setup] libraries: {libraries}")
+
 extensions = []
 
 # _renderer extension（C 扩展，运行时动态加载 Zig）
@@ -162,15 +226,18 @@ if os.path.exists(renderer_src):
     # Linux/macOS 需要 -ldl 用于 dlopen/dlsym 动态加载
     link_args = ['/LTCG'] if os.name == 'nt' else ['-ldl']
 
+    ext_kwargs = dict(
+        sources=[renderer_src],
+        extra_compile_args=compile_args,
+        extra_link_args=link_args,
+        include_dirs=include_dirs,
+        library_dirs=library_dirs,
+    )
+    if libraries:
+        ext_kwargs['libraries'] = libraries
+
     extensions.append(
-        Extension(
-            'zeroai_tui._renderer',
-            sources=[renderer_src],
-            extra_compile_args=compile_args,
-            extra_link_args=link_args,
-            # 注意：不在这里链接 zig_render，C 扩展运行时动态加载
-            # Linux: -ldl 链接 libdl（dlopen/dlsym/dlclose）
-        )
+        Extension('zeroai_tui._renderer', **ext_kwargs)
     )
 else:
     print(f"[setup] WARNING: {renderer_src} not found")
@@ -181,13 +248,18 @@ if os.path.exists(terminal_src):
     compile_args = ['/O2', '/GL'] if os.name == 'nt' else ['-O3', '-fPIC']
     link_args = ['/LTCG'] if os.name == 'nt' else []
 
+    ext_kwargs = dict(
+        sources=[terminal_src],
+        extra_compile_args=compile_args,
+        extra_link_args=link_args,
+        include_dirs=include_dirs,
+        library_dirs=library_dirs,
+    )
+    if libraries:
+        ext_kwargs['libraries'] = libraries
+
     extensions.append(
-        Extension(
-            'zeroai_tui._terminal',
-            sources=[terminal_src],
-            extra_compile_args=compile_args,
-            extra_link_args=link_args,
-        )
+        Extension('zeroai_tui._terminal', **ext_kwargs)
     )
 else:
     print(f"[setup] WARNING: {terminal_src} not found")
