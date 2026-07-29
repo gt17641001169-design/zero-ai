@@ -1211,7 +1211,17 @@ class LRUCache:
 _expert_route_cache = LRUCache(maxsize=256)
 
 async def route_expert_glm(user_input: str) -> str:
-    """用GLM语义判断用户意图，路由到最合适的专家"""
+    """混合路由：关键词快速匹配优先，匹配失败才走 GLM 语义路由
+
+    优化策略（v1.1.3+）：
+    1. 短消息（<10字）→ 纯关键词，0 延迟
+    2. 关键词命中明确专家（非 knowledge）→ 直接返回，0 延迟
+    3. 关键词返回 knowledge（兜底）→ 走 GLM 语义路由，1-2 秒延迟
+    4. 缓存命中 → 直接返回，0 延迟
+
+    这样大部分问题（代码/论文/中文写作等关键词明确的）零延迟路由，
+    只有模糊问题才需要 GLM 语义判断。
+    """
     # 短消息用关键词快速预判（省时间）
     if len(user_input) < 10:
         return route_expert(user_input)
@@ -1222,6 +1232,14 @@ async def route_expert_glm(user_input: str) -> str:
     if cached is not None:
         return cached
 
+    # ── 混合优化：先跑关键词匹配 ──
+    # 关键词命中明确专家（非 knowledge）→ 直接返回，跳过 GLM API 调用
+    kw_result = route_expert(user_input)
+    if kw_result != "knowledge":
+        _expert_route_cache.set(cache_key, kw_result)
+        return kw_result
+
+    # ── 关键词未命中（返回 knowledge），走 GLM 语义路由 ──
     glm_cfg = MODEL_CONFIGS["glm-v"]  # 用多模态模型做路由（支持图片消息）
     try:
         client = _make_openai_client("glm-v")
@@ -1258,14 +1276,12 @@ async def route_expert_glm(user_input: str) -> str:
                 _expert_route_cache.set(cache_key, vk)
                 return vk
         # 无效返回，降级到关键词
-        expert_key = route_expert(user_input)
-        _expert_route_cache.set(cache_key, expert_key)
-        return expert_key
+        _expert_route_cache.set(cache_key, "knowledge")
+        return "knowledge"
     except Exception:
         # GLM判断失败，降级到关键词
-        expert_key = route_expert(user_input)
-        _expert_route_cache.set(cache_key, expert_key)
-        return expert_key
+        _expert_route_cache.set(cache_key, "knowledge")
+        return "knowledge"
 
 
 def get_expert_config(expert_key: str) -> dict:
@@ -15211,11 +15227,24 @@ def _auto_generate_agents_md(project_dir: str) -> str:
                                 ("      混合模式可调度多位专家协作，生成更完整的长文内容\n", C_DIM),
                             ))
                         if len(last_user) >= 10:
-                            block = self._add_block("路由分析", C_DIM)
-                            block.update(Text.assemble(
-                                (f"  {_load_svg_icon('search')} GLM 正在分析问题类型…\n", C_DIM),
-                            ))
-                        expert_key = await route_expert_glm(last_user)
+                            # 混合路由：先跑关键词匹配，命中就不显示"GLM分析"
+                            _kw_pre = route_expert(last_user)
+                            if _kw_pre != "knowledge":
+                                # 关键词命中，零延迟路由
+                                block = self._add_block("路由分析", C_DIM)
+                                block.update(Text.assemble(
+                                    (f"  {_load_svg_icon('search')} 路由 → {EXPERT_TEAM[_kw_pre]['label']}\n", C_DIM),
+                                ))
+                                expert_key = _kw_pre
+                            else:
+                                # 关键词未命中，走 GLM 语义路由
+                                block = self._add_block("路由分析", C_DIM)
+                                block.update(Text.assemble(
+                                    (f"  {_load_svg_icon('search')} GLM 正在分析问题类型…\n", C_DIM),
+                                ))
+                                expert_key = await route_expert_glm(last_user)
+                        else:
+                            expert_key = route_expert(last_user)
                         _loop_expert_key = expert_key
                     else:
                         expert_key = _loop_expert_key
