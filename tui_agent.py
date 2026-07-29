@@ -56,6 +56,7 @@ import atexit
 import subprocess
 import re
 import asyncio
+import hashlib
 import shutil
 import platform
 import locale
@@ -1211,8 +1212,8 @@ async def route_expert_glm(user_input: str) -> str:
     if len(user_input) < 10:
         return route_expert(user_input)
 
-    # 缓存命中
-    cache_key = user_input[:200]
+    # 缓存命中（使用 MD5 摘要作为 key，避免长 JSON 链因前 200 字符相同而冲突）
+    cache_key = hashlib.md5(user_input.encode("utf-8")).hexdigest()[:16]
     cached = _expert_route_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -13885,9 +13886,11 @@ class ZeroAI(App):
                 (f"  │ 当前约 {est_tokens_pre} tokens（清理阈值 {cleanup_threshold}，压缩阈值 {compress_threshold}）\n", C_DIM),
             ))
             await cleanup_and_compress(self, _ctx_log)
+            self._precise_input_tokens = 0
         else:
             # 未触发清理阈值，但仍调用一次（内部会判断是否需要压缩）
             await cleanup_and_compress(self, _ctx_log if est_tokens_pre > compress_threshold else None)
+            self._precise_input_tokens = 0
 
         # 获取用户最后一条消息
         last_user = ""
@@ -14843,30 +14846,33 @@ class ZeroAI(App):
             self._is_generating = False
             return
 
-        # ── 上下文自动压缩：超阈值时先压缩历史 ──
+        # ── 上下文自动压缩：两层防护（30% 清理 + 70% GLM 压缩），防止上下文爆炸 ──
         try:
-            est_tokens = _estimate_tokens(self.messages)
-            threshold = int(self.context_limit * COMPRESS_THRESHOLD_RATIO)
-            if est_tokens > threshold and len(self.messages) > 10:
-                block_compress = self._add_block("上下文压缩", C_DIM)
-                block_compress.update(Text.assemble(
-                    (f"  {_load_svg_icon('tool')} 上下文自动压缩\n", f"bold {C_DIM}"),
-                    (f"  │ 当前约 {est_tokens} tokens，超过阈值 {threshold}，正在压缩…\n", C_DIM),
-                ))
-                old_count = len(self.messages)
-                old_tokens = est_tokens
-                self.messages = await compress_context(self.messages, self.context_limit)
-                new_tokens = _estimate_tokens(self.messages)
-                new_count = len(self.messages)
+            est_tokens_pre = _estimate_tokens(self.messages)
+            cleanup_threshold = int(self.context_limit * CLEANUP_THRESHOLD_RATIO)
+            compress_threshold = int(self.context_limit * COMPRESS_THRESHOLD_RATIO)
+
+            def _ctx_log(text, style=None):
                 self._add_static(Text.assemble(
-                    (f"  {_load_svg_icon('check')} 压缩完成：", C_DIM),
-                    (f"{old_count}→{new_count} 条消息，", f"bold {C_FG}"),
-                    (f"约 {old_tokens}→{new_tokens} tokens\n", C_DIM),
-                    ("  └─\n", C_DIM),
+                    (text, style if style else C_DIM),
                 ))
+
+            if est_tokens_pre > cleanup_threshold and len(self.messages) > 8:
+                block_ctx = self._add_block("上下文管理", C_DIM)
+                block_ctx.update(Text.assemble(
+                    (f"  {_load_svg_icon('tool')} 上下文管理\n", f"bold {C_DIM}"),
+                    (f"  │ 当前约 {est_tokens_pre} tokens（清理阈值 {cleanup_threshold}，压缩阈值 {compress_threshold}）\n", C_DIM),
+                ))
+                await cleanup_and_compress(self, _ctx_log)
+                # 清理后重置精确输入 token，让右侧统计重新估算
+                self._precise_input_tokens = 0
+            else:
+                # 未触发清理阈值，但仍检查是否需要 GLM 压缩
+                await cleanup_and_compress(self, _ctx_log if est_tokens_pre > compress_threshold else None)
+                self._precise_input_tokens = 0
         except Exception as e:
             # 压缩失败不阻塞对话
-            self._add_static(Text(f"  {_load_svg_icon('warning')} 上下文压缩跳过：{str(e)[:80]}\n", style=C_DIM))
+            self._add_static(Text(f"  {_load_svg_icon('warning')} 上下文管理跳过：{str(e)[:80]}\n", style=C_DIM))
 
         _loop_expert_key = None
         _tool_call_count = 0
@@ -14951,9 +14957,22 @@ class ZeroAI(App):
                     _ctx_len = sum(len(str(m.get("content", ""))) for m in self.messages)
                     # 动态超时：上下文越长，超时越长。最小90秒，最大600秒（10分钟）
                     _dyn_timeout = min(600, max(90, 90 + _ctx_len // 500))
+                    # ── 注入专家 system prompt（替换通用 SYSTEM_PROMPT，确保模型明确角色）──
+                    expert_system = EXPERT_TEAM[expert_key].get("system_prompt", SYSTEM_PROMPT)
+                    _raw_filtered = _filter_messages_for_model(self.messages, ecfg["model"])
+                    _expert_messages = []
+                    _system_injected = False
+                    for _m in _raw_filtered:
+                        if _m.get("role") == "system" and not _system_injected:
+                            _expert_messages.append({"role": "system", "content": expert_system})
+                            _system_injected = True
+                        else:
+                            _expert_messages.append(_m)
+                    if not _system_injected:
+                        _expert_messages.insert(0, {"role": "system", "content": expert_system})
                     api_params = {
                         "model": ecfg["model"],
-                        "messages": _filter_messages_for_model(self.messages, ecfg["model"]),
+                        "messages": _expert_messages,
                         "tools": TOOLS,
                         "temperature": self.temperature,
                         "stream": self.stream_enabled,
@@ -15050,9 +15069,13 @@ class ZeroAI(App):
                                     base_url=fb_cfg["base_url"], api_key=fb_cfg["api_key"],
                                     timeout=180.0, max_retries=0,  # 降级时用更长超时
                                 )
+                            # 降级时仍保留专家 system prompt，避免模型丢失角色说英文
+                            _fallback_messages = _filter_messages_for_model(_expert_messages, fb_cfg["model"])
+                            if not any(m.get("role") == "system" for m in _fallback_messages):
+                                _fallback_messages.insert(0, {"role": "system", "content": expert_system})
                             api_params = {
                                 "model": fb_cfg["model"],
-                                "messages": _filter_messages_for_model(self.messages, fb_cfg["model"]),
+                                "messages": _fallback_messages,
                                 "tools": TOOLS,
                                 "temperature": self.temperature,
                                 "stream": self.stream_enabled,
@@ -15120,6 +15143,10 @@ class ZeroAI(App):
                 _loop_detect_window = 6
                 _loop_detect_threshold = 4
                 _loop_detected = False
+                # 内容层循环检测（防止模型在正文重复输出无意义片段，如"代码执行前必须问"）
+                _content_loop_buf = []
+                _content_loop_window = 8
+                _content_loop_threshold = 5
                 # Token 统计：开始计时
                 self.stream_start_time = time.time()
                 self.stream_token_count = 0
@@ -15164,6 +15191,51 @@ class ZeroAI(App):
                         full_content += delta.content
                         # 过滤模型内部特殊标签（<|observation|> <|system|> 等，防止泄露给用户）
                         full_content = _strip_model_tokens(full_content)
+                        # 内容层循环检测：连续 N 个 chunk 内容相同且非空，判定为模型陷入重复
+                        content_chunk = delta.content.strip()
+                        if content_chunk:
+                            _content_loop_buf.append(content_chunk)
+                            if len(_content_loop_buf) > _content_loop_window:
+                                _content_loop_buf.pop(0)
+                            if len(_content_loop_buf) >= _content_loop_threshold:
+                                recent = _content_loop_buf[-_content_loop_threshold:]
+                                if len(set(recent)) <= 1 and len(recent[0]) >= 2:
+                                    _loop_detected = True
+                                    full_content += "\n[系统自动截断：检测到重复输出]"
+                                    self._add_static(Text("  └─ ⚠️ 检测到模型重复输出，已自动截断", style="bold yellow"))
+                                    break
+                            # 额外防御：单 chunk 内出现大量重复标记（如 <回答> 链、用户回应链）
+                            _dup_markers = ["<回答>", "用户回应", "function_calling"]
+                            for _dm in _dup_markers:
+                                if _dm in content_chunk and content_chunk.count(_dm) >= 4:
+                                    _loop_detected = True
+                                    full_content += "\n[系统自动截断：检测到重复标记链]"
+                                    self._add_static(Text("  └─ ⚠️ 检测到重复标记链，已自动截断", style="bold yellow"))
+                                    break
+                            if _loop_detected:
+                                break
+                            # 通用防御：末尾 200 字符内短子串高频重复
+                            if len(full_content) >= 200:
+                                _tail = full_content[-200:]
+                                _repeated = False
+                                for _sub_len in range(3, 16):
+                                    _sub_counts = {}
+                                    for _i in range(len(_tail) - _sub_len + 1):
+                                        _sub = _tail[_i:_i + _sub_len]
+                                        if any(c.isspace() for c in _sub):
+                                            continue
+                                        _sub_counts[_sub] = _sub_counts.get(_sub, 0) + 1
+                                    if _sub_counts:
+                                        _max_sub, _max_cnt = max(_sub_counts.items(), key=lambda x: x[1])
+                                        _threshold = max(5, 150 // _sub_len)
+                                        if _max_cnt >= _threshold:
+                                            _repeated = True
+                                            break
+                                if _repeated:
+                                    _loop_detected = True
+                                    full_content += "\n[系统自动截断：检测到循环内容]"
+                                    self._add_static(Text("  └─ ⚠️ 检测到循环内容，已自动截断", style="bold yellow"))
+                                    break
                         update_counter += 1
                         # 统计 token（每个 chunk 约 1 token）
                         self.stream_token_count += 1

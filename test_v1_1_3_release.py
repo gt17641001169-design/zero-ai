@@ -75,8 +75,8 @@ def test_tools_imports():
         voice,
     )
     from zeroai.tools.registry import TOOLS, TOOL_MAP
-    assert len(TOOLS) == 58, f"TOOLS 数量错误: {len(TOOLS)}"
-    assert len(TOOL_MAP) == 58, f"TOOL_MAP 数量错误: {len(TOOL_MAP)}"
+    assert len(TOOLS) == 63, f"TOOLS 数量错误: {len(TOOLS)}"
+    assert len(TOOL_MAP) == 63, f"TOOL_MAP 数量错误: {len(TOOL_MAP)}"
     tools_keys = {t["function"]["name"] for t in TOOLS}
     map_keys = set(TOOL_MAP.keys())
     assert tools_keys == map_keys, "TOOLS 和 TOOL_MAP key 不一致"

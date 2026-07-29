@@ -18,6 +18,7 @@
 - runtime.py：_interruptible_await
 """
 import re
+import hashlib
 from collections import OrderedDict
 
 from .constants import EXPERT_TEAM, MODEL_CONFIGS
@@ -76,8 +77,8 @@ async def route_expert_glm(user_input: str) -> str:
     if len(user_input) < 10:
         return route_expert(user_input)
 
-    # 缓存命中
-    cache_key = user_input[:200]
+    # 缓存命中（使用 MD5 摘要作为 key，避免长 JSON 链因前 200 字符相同而冲突）
+    cache_key = hashlib.md5(user_input.encode("utf-8")).hexdigest()[:16]
     cached = _expert_route_cache.get(cache_key)
     if cached is not None:
         return cached

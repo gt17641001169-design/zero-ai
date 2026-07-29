@@ -19,6 +19,7 @@
 """
 import asyncio
 import re
+import hashlib
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from collections import OrderedDict, deque
 from .config import get_config
@@ -134,7 +135,7 @@ class ExpertRouter:
         if len(user_input) < 10:
             return self.route_by_keywords(user_input)
 
-        cache_key = user_input[:200]
+        cache_key = hashlib.md5(user_input.encode("utf-8")).hexdigest()[:16]
         cached = self._route_cache.get(cache_key)
         if cached is not None:
             return cached

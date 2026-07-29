@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from .llm import LLMClient
+from .context import cleanup_and_compress, get_model_context_limit
 
 
 # ============================================================================
@@ -659,6 +660,13 @@ class AgentLoop:
         """
         executed_steps: List[Dict[str, Any]] = []
         final_answer = ""
+
+        # 阶段 V：进入循环前先压缩上下文，防止上下文爆炸
+        try:
+            context_limit = get_model_context_limit(self.planner.llm.model) or 8000
+            messages = await cleanup_and_compress(messages, context_limit)
+        except Exception:
+            pass
 
         # 阶段 P.2：流式思维链开始
         if self._streaming_emitter is not None:
@@ -1710,6 +1718,13 @@ class AdvancedAgentLoop(AgentLoop):
         self.thought_chain = []
         if self.reflexion_engine:
             self.reflexion_engine.reset()
+
+        # 阶段 V：进入循环前先压缩上下文，防止上下文爆炸
+        try:
+            context_limit = get_model_context_limit(self.planner.llm.model) or 8000
+            messages = await cleanup_and_compress(messages, context_limit)
+        except Exception:
+            pass
 
         # 分支：Plan-and-Execute 模式
         if self.enable_plan and self.plan_planner:

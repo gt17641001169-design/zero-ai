@@ -3,6 +3,7 @@ import asyncio
 from typing import Optional, Dict, Any, List, AsyncGenerator
 from openai import OpenAI, AsyncOpenAI
 from .config import get_config
+from .constants import MODEL_CONFIGS
 
 
 class LLMClient:
@@ -12,7 +13,14 @@ class LLMClient:
         """Initialize LLM client with model configuration"""
         self.config = get_config()
         self.model_key = model_key
-        self._model_config = self.config.get_model_config(model_key)
+        try:
+            self._model_config = self.config.get_model_config(model_key)
+            # 如果 config.yaml 中 api_key 为空，回退到 constants.MODEL_CONFIGS
+            if not self._model_config.get("api_key") and model_key in MODEL_CONFIGS:
+                self._model_config = MODEL_CONFIGS[model_key].copy()
+        except Exception:
+            # 配置读取失败时回退到内置常量配置
+            self._model_config = MODEL_CONFIGS.get(model_key, {}).copy()
         self._client = None
         self._async_client = None
     
@@ -40,7 +48,85 @@ class LLMClient:
     def model(self) -> str:
         """Get model name"""
         return self._model_config["model"]
-    
+
+    # ========================================================================
+    # 阶段 V：模型降级策略（主模型限流时自动切换备用模型）
+    # ========================================================================
+
+    def _fallback_model_keys(self) -> List[str]:
+        """获取降级模型序列（主模型 -> glm-4 -> openrouter -> ollama）"""
+        keys = [self.model_key]
+        for key in ("glm-4", "openrouter", "ollama"):
+            if key != self.model_key and key in MODEL_CONFIGS:
+                keys.append(key)
+        return keys
+
+    def _is_fallback_eligible(self, exc: Exception) -> bool:
+        """判断异常是否适合触发模型降级"""
+        # 导入 openai 异常类型（兼容不同版本）
+        try:
+            from openai import (
+                RateLimitError,
+                APIConnectionError,
+                APITimeoutError,
+                InternalServerError,
+            )
+        except ImportError:
+            RateLimitError = APIConnectionError = APITimeoutError = InternalServerError = None
+
+        if RateLimitError and isinstance(
+            exc,
+            (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError),
+        ):
+            return True
+
+        msg = str(exc).lower()
+        for hint in (
+            "rate limit",
+            "429",
+            "too many requests",
+            "timeout",
+            "connection",
+            "temporarily unavailable",
+            "overloaded",
+            "server error",
+            "503",
+            "502",
+        ):
+            if hint in msg:
+                return True
+        return False
+
+    def _get_fallback_config(self, model_key: str) -> Dict[str, Any]:
+        """获取指定模型的配置（优先 config.yaml，否则 constants）"""
+        try:
+            cfg = self.config.get_model_config(model_key)
+            if cfg.get("api_key"):
+                return cfg
+        except Exception:
+            pass
+        return MODEL_CONFIGS.get(model_key, {}).copy()
+
+    def _get_sync_client_for(self, model_key: str) -> OpenAI:
+        """获取指定模型的同步客户端（主模型复用缓存）"""
+        if model_key == self.model_key:
+            return self.client
+        cfg = self._get_fallback_config(model_key)
+        return OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"])
+
+    def _get_async_client_for(self, model_key: str) -> AsyncOpenAI:
+        """获取指定模型的异步客户端（主模型复用缓存）"""
+        if model_key == self.model_key:
+            return self.async_client
+        cfg = self._get_fallback_config(model_key)
+        return AsyncOpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"])
+
+    def _get_model_name_for(self, model_key: str) -> str:
+        """获取指定模型的模型名"""
+        if model_key == self.model_key:
+            return self.model
+        return self._get_fallback_config(model_key).get("model", "")
+
     def chat_sync(
         self,
         system_prompt: str,
@@ -49,28 +135,37 @@ class LLMClient:
         max_tokens: int = 2000,
         stream: bool = False
     ) -> Optional[str]:
-        """Synchronous chat completion"""
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=stream
-            )
-            
-            if stream:
-                # For streaming, return generator
-                return self._handle_stream_sync(response)
-            else:
+        """Synchronous chat completion（支持模型降级）"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        last_error = None
+
+        for idx, model_key in enumerate(self._fallback_model_keys()):
+            try:
+                client = self._get_sync_client_for(model_key)
+                response = client.chat.completions.create(
+                    model=self._get_model_name_for(model_key),
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=stream,
+                )
+                if stream:
+                    return self._handle_stream_sync(response)
                 return response.choices[0].message.content
-                
-        except Exception as e:
-            print(f"LLM call failed: {e}")
-            return None
+            except Exception as e:
+                last_error = e
+                # 第一次失败且不符合降级条件时直接返回 None
+                if idx == 0 and not self._is_fallback_eligible(e):
+                    print(f"LLM call failed: {e}")
+                    return None
+                print(f"LLM [{model_key}] failed, trying fallback: {e}")
+                continue
+
+        print(f"All fallback models failed: {last_error}")
+        return None
     
     async def chat(
         self,
@@ -81,34 +176,44 @@ class LLMClient:
         stream: bool = False,
         timeout: float = 30
     ) -> Optional[str]:
-        """Asynchronous chat completion"""
-        try:
-            response = await asyncio.wait_for(
-                self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=stream
-                ),
-                timeout=timeout
-            )
-            
-            if stream:
-                # For streaming, return async generator
-                return self._handle_stream_async(response)
-            else:
+        """Asynchronous chat completion（支持模型降级）"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        last_error = None
+
+        for idx, model_key in enumerate(self._fallback_model_keys()):
+            try:
+                client = self._get_async_client_for(model_key)
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=self._get_model_name_for(model_key),
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=stream,
+                    ),
+                    timeout=timeout,
+                )
+                if stream:
+                    return self._handle_stream_async(response)
                 return response.choices[0].message.content
-                
-        except asyncio.TimeoutError:
-            print(f"LLM call timed out after {timeout}s")
-            return None
-        except Exception as e:
-            print(f"LLM call failed: {e}")
-            return None
+            except asyncio.TimeoutError:
+                # 超时属于可降级异常
+                last_error = f"timed out after {timeout}s"
+                print(f"LLM [{model_key}] timed out after {timeout}s, trying fallback")
+                continue
+            except Exception as e:
+                last_error = e
+                if idx == 0 and not self._is_fallback_eligible(e):
+                    print(f"LLM call failed: {e}")
+                    return None
+                print(f"LLM [{model_key}] failed, trying fallback: {e}")
+                continue
+
+        print(f"All fallback models failed: {last_error}")
+        return None
     
     async def chat_with_messages(
         self,
@@ -118,30 +223,39 @@ class LLMClient:
         stream: bool = False,
         timeout: float = 60
     ) -> Optional[str]:
-        """Chat completion with custom messages"""
-        try:
-            response = await asyncio.wait_for(
-                self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=stream
-                ),
-                timeout=timeout
-            )
-            
-            if stream:
-                return self._handle_stream_async(response)
-            else:
+        """Chat completion with custom messages（支持模型降级）"""
+        last_error = None
+
+        for idx, model_key in enumerate(self._fallback_model_keys()):
+            try:
+                client = self._get_async_client_for(model_key)
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=self._get_model_name_for(model_key),
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=stream,
+                    ),
+                    timeout=timeout,
+                )
+                if stream:
+                    return self._handle_stream_async(response)
                 return response.choices[0].message.content
-                
-        except asyncio.TimeoutError:
-            print(f"LLM call timed out after {timeout}s")
-            return None
-        except Exception as e:
-            print(f"LLM call failed: {e}")
-            return None
+            except asyncio.TimeoutError:
+                last_error = f"timed out after {timeout}s"
+                print(f"LLM [{model_key}] timed out after {timeout}s, trying fallback")
+                continue
+            except Exception as e:
+                last_error = e
+                if idx == 0 and not self._is_fallback_eligible(e):
+                    print(f"LLM call failed: {e}")
+                    return None
+                print(f"LLM [{model_key}] failed, trying fallback: {e}")
+                continue
+
+        print(f"All fallback models failed: {last_error}")
+        return None
     
     def _handle_stream_sync(self, response) -> str:
         """Handle synchronous streaming response"""
