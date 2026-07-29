@@ -6,6 +6,7 @@
 - retriever.py：检索接口，供 AgentLoop 调用
 - conversation_memory.py：对话历史向量化（阶段 2.2，跨会话记忆）
 - file_watcher.py：项目文件后台监视器（阶段 2.5，增量索引）
+- rag_pipeline.py：完整 RAG 管道（阶段 M.3，语义分块+混合检索+MMR重排序+上下文压缩）
 
 设计原则：
 1. 零外部依赖：不强制要求 faiss/chromadb，用 numpy 实现余弦相似度
@@ -14,12 +15,21 @@
 4. 增量更新：文件变更时只重新索引变更部分
 5. 混合检索：向量语义检索 + BM25 关键词检索融合（阶段 2.3）
 6. 记忆衰减：时间 + 访问频率衰减，避免噪声淹没（阶段 2.4）
+7. 生产级 RAG：语义分块 + MMR 多样性重排序 + 上下文压缩（阶段 M.3）
 """
 from .vector_store import VectorStore, get_vector_store
 from .project_indexer import ProjectIndexer, index_project
 from .retriever import Retriever, get_retriever
 from .conversation_memory import ConversationMemory, get_conversation_memory
 from .file_watcher import FileWatcher, get_file_watcher
+from .rag_pipeline import (
+    SemanticChunker,
+    MMRReranker,
+    ContextCompressor,
+    RAGPipeline,
+    get_rag_pipeline,
+    reset_rag_pipeline,
+)
 
 __all__ = [
     "VectorStore",
@@ -32,4 +42,11 @@ __all__ = [
     "get_conversation_memory",
     "FileWatcher",
     "get_file_watcher",
+    # 阶段 M.3
+    "SemanticChunker",
+    "MMRReranker",
+    "ContextCompressor",
+    "RAGPipeline",
+    "get_rag_pipeline",
+    "reset_rag_pipeline",
 ]

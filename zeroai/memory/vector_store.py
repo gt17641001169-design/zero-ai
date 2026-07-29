@@ -143,10 +143,18 @@ class TfidfVectorizer:
 # ============================================================================
 
 class EmbeddingBackend:
-    """Embedding 后端：优先用 API，回退到 TF-IDF"""
+    """Embedding 后端：优先用 API，回退到 TF-IDF
+
+    阶段 M.2 升级：
+    - 支持注入外部 embed_func（来自 LLMClient.embed）
+    - 支持自定义维度
+    - 保留 TF-IDF 作为离线兜底
+    """
 
     def __init__(self, model_key: str = "glm", api_key: str = "", base_url: str = "",
-                 auto_config: bool = False):
+                 auto_config: bool = False,
+                 embed_func: Optional[callable] = None,
+                 embed_dim: int = 1024):
         """初始化
 
         Args:
@@ -156,12 +164,20 @@ class EmbeddingBackend:
             auto_config: 是否自动从 zeroai.core.constants.MODEL_CONFIGS 读取配置
                          True 时若 api_key 为空，会尝试从项目配置加载 GLM/OpenRouter Key
                          并遵循代理配置（PROXY_CONFIG）
+            embed_func: 外部嵌入函数（阶段 M.2）
+                        签名: async def func(texts: List[str]) -> List[List[float]]
+                        优先级高于 api_key，注入后直接使用
+            embed_dim: 嵌入向量维度（仅 embed_func 模式生效）
         """
         self.model_key = model_key
         self._tfidf: Optional[TfidfVectorizer] = None
 
+        # 阶段 M.2：外部 embed_func 注入
+        self._embed_func = embed_func
+        self._embed_dim = embed_dim
+
         # 阶段 2.1：自动从项目配置读取 API Key 和代理
-        if auto_config and not api_key:
+        if auto_config and not api_key and embed_func is None:
             try:
                 from zeroai.core.constants import MODEL_CONFIGS
                 from zeroai.core.secrets import _is_proxy_enabled, PROXY_CONFIG
@@ -182,7 +198,7 @@ class EmbeddingBackend:
 
         self.api_key = api_key
         self.base_url = base_url
-        self._api_available = bool(api_key)
+        self._api_available = bool(api_key) or embed_func is not None
 
     async def embed_texts(self, texts: List[str]) -> np.ndarray:
         """将文本列表转为向量矩阵
@@ -192,6 +208,16 @@ class EmbeddingBackend:
         """
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
+
+        # 阶段 M.2：优先使用外部 embed_func
+        if self._embed_func is not None:
+            try:
+                vectors = await self._embed_func(texts)
+                if vectors:
+                    return np.array(vectors, dtype=np.float32)
+            except Exception:
+                self._embed_func = None  # 失败后回退
+                self._api_available = False
 
         # 1. 尝试 API embedding
         if self._api_available:
@@ -210,6 +236,8 @@ class EmbeddingBackend:
         智谱 embedding-3 支持 256/512/1024/2048 维
         用 1024 维平衡精度和性能
         """
+        if self._embed_func is not None:
+            return self._embed_dim
         if self._api_available:
             return 1024  # 智谱 embedding-3，1024 维
         return 256  # TF-IDF 降维维度
@@ -245,13 +273,39 @@ class EmbeddingBackend:
         return np.stack([self._tfidf.transform(t) for t in texts]) if texts else np.zeros((0, 256), dtype=np.float32)
 
     def embed_query(self, text: str) -> np.ndarray:
-        """同步嵌入查询文本（用于检索时）"""
-        if self._api_available:
-            # API 是异步的，同步调用时回退到 TF-IDF
-            pass
+        """同步嵌入查询文本（用于检索时）
+
+        阶段 M.2：当注入 embed_func 时，用同步 embed_sync 生成查询向量
+        """
+        # 阶段 M.2：如果有外部 embed_func，尝试同步调用
+        if self._embed_func is not None:
+            # embed_func 是异步的，同步场景下尝试事件循环
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # 已在事件循环中，无法同步调用，回退到零向量
+                    # 这种情况下应该用 search_async
+                    pass
+                else:
+                    vectors = loop.run_until_complete(self._embed_func([text]))
+                    if vectors and len(vectors) > 0:
+                        return np.array(vectors[0], dtype=np.float32)
+            except RuntimeError:
+                # 没有事件循环，尝试新建
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    vectors = loop.run_until_complete(self._embed_func([text]))
+                    if vectors and len(vectors) > 0:
+                        return np.array(vectors[0], dtype=np.float32)
+                except Exception:
+                    pass
+
         if self._tfidf is None:
             # 未拟合，用空向量
-            return np.zeros(256, dtype=np.float32)
+            return np.zeros(self.dim, dtype=np.float32)
         vec = self._tfidf.transform(text)
         # 如果查询词全不在 vocab 中，返回零向量（search 会过滤零分结果）
         return vec
@@ -267,6 +321,10 @@ class VectorStore:
     数据布局：
     - sqlite 表 chunks(id, doc_id, source, content, hash, created_at)
     - numpy .npy 存向量矩阵（按 chunk id 顺序）
+
+    阶段 M.2 升级：
+    - 可选 FAISS 索引加速（自动检测，有则用，无则回退 numpy）
+    - 支持外部 embedding 函数注入
     """
 
     def __init__(self, db_path: str, embedding: Optional[EmbeddingBackend] = None):
@@ -280,6 +338,14 @@ class VectorStore:
         self.embedding = embedding or EmbeddingBackend()
         self._lock = threading.Lock()
         self._init_db()
+        # 阶段 M.2：可选 FAISS 索引
+        self._faiss_index = None
+        self._faiss_available = False
+        try:
+            import faiss  # type: ignore
+            self._faiss_available = True
+        except ImportError:
+            pass  # FAISS 未安装，回退 numpy
 
     def _init_db(self) -> None:
         """初始化 sqlite 表结构"""

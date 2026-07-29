@@ -150,12 +150,124 @@ class LLMClient:
             if chunk.choices and chunk.choices[0].delta.content:
                 content += chunk.choices[0].delta.content
         return content
-    
+
     async def _handle_stream_async(self, response) -> AsyncGenerator[str, None]:
         """Handle asynchronous streaming response"""
         async for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+
+    # ========================================================================
+    # 阶段 M.1：Embedding API 对接（GLM embedding-3）
+    # ========================================================================
+
+    async def embed(
+        self,
+        texts: List[str],
+        dimensions: int = 1024,
+        timeout: float = 30,
+    ) -> List[List[float]]:
+        """异步生成文本嵌入向量（阶段 M.1）
+
+        使用 GLM embedding-3 模型，支持 256/512/1024/2048 维。
+        自动批量处理（单次最多 64 条），避免 API 限流。
+
+        Args:
+            texts: 待嵌入的文本列表
+            dimensions: 输出维度（256/512/1024/2048）
+            timeout: 单次请求超时秒数
+
+        Returns:
+            嵌入向量列表，shape=(len(texts), dimensions)
+            失败时返回空列表
+
+        Raises:
+            RuntimeError: API 调用失败
+        """
+        if not texts:
+            return []
+
+        # 批量处理（单次最多 64 条，GLM 限制）
+        batch_size = 64
+        all_vectors: List[List[float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            try:
+                resp = await asyncio.wait_for(
+                    self.async_client.embeddings.create(
+                        model="embedding-3",
+                        input=batch,
+                        dimensions=dimensions,
+                    ),
+                    timeout=timeout,
+                )
+                # 按 index 排序确保顺序正确
+                sorted_data = sorted(resp.data, key=lambda x: x.index)
+                for item in sorted_data:
+                    all_vectors.append(item.embedding)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"Embedding API 超时（{timeout}s）")
+            except Exception as e:
+                raise RuntimeError(f"Embedding API 调用失败: {e}")
+
+        return all_vectors
+
+    def embed_sync(
+        self,
+        texts: List[str],
+        dimensions: int = 1024,
+    ) -> List[List[float]]:
+        """同步生成文本嵌入向量（阶段 M.1）
+
+        同 embed() 的同步版本，用于无法 await 的场景。
+
+        Args:
+            texts: 待嵌入的文本列表
+            dimensions: 输出维度
+
+        Returns:
+            嵌入向量列表，失败时返回空列表
+        """
+        if not texts:
+            return []
+
+        batch_size = 64
+        all_vectors: List[List[float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            try:
+                resp = self.client.embeddings.create(
+                    model="embedding-3",
+                    input=batch,
+                    dimensions=dimensions,
+                )
+                sorted_data = sorted(resp.data, key=lambda x: x.index)
+                for item in sorted_data:
+                    all_vectors.append(item.embedding)
+            except Exception as e:
+                print(f"Embedding API 调用失败: {e}")
+                return []
+
+        return all_vectors
+
+    async def embed_one(
+        self,
+        text: str,
+        dimensions: int = 1024,
+    ) -> List[float]:
+        """嵌入单条文本（便捷方法）
+
+        Args:
+            text: 待嵌入文本
+            dimensions: 输出维度
+
+        Returns:
+            嵌入向量，失败时返回空列表
+        """
+        vectors = await self.embed([text], dimensions=dimensions)
+        return vectors[0] if vectors else []
 
 
 class MultiModelClient:
