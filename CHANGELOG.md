@@ -5,6 +5,60 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] - 2026-07-29
+
+### 新增 - 阶段 N（代码执行沙箱）
+- **CodeSafetyChecker**：AST 静态分析危险调用（os.system/subprocess/ctypes/socket 等），支持白名单模式
+- **CodeSandbox**：子进程隔离执行，超时/内存限制，网络隔离，临时工作目录自动清理
+- **工具注册**：`code_execute`（沙箱执行）和 `code_check`（安全检查）注册到 TOOL_MAP
+
+### 新增 - 阶段 O（多 Agent 协作增强）
+- **MessageBus**：主题发布订阅消息总线，异步分发，消息历史，Agent 注册表
+- **Blackboard**：分区共享状态黑板，版本控制，观察者通知，历史追溯
+- **RoleDependencyGraph**：角色依赖图，拓扑排序，并行批次调度
+- **EnhancedMultiAgentCollaborator**：增强多 Agent 协作器，管道式协作，共识投票，基于 Blackboard 共享上下文
+
+### 新增 - 阶段 P（流式思维链 + 中断响应 + 进度跟踪）
+- **StreamingThoughtEmitter**：流式思维链发射器，支持 immediate/chunked/full 三种缓冲模式
+- **InterruptionHandler**：线程安全中断处理器，回调通知，重置支持
+- **ProgressTracker**：工具调用进度跟踪器，多调用并行跟踪，进度条渲染，统计聚合
+- **AgentLoop 集成**：新增 `enable_progress_tracker`/`enable_streaming_thought` 参数，`interrupt()`/`get_progress_summary()`/`get_progress_stats()` 方法
+
+### 新增 - 阶段 Q（项目代码知识图谱）
+- **CodeKnowledgeGraph**：基于 AST 解析的代码知识图谱，提取 module/class/function/method/import 节点
+- **代码关系边**：calls（调用）/inherits（继承）/imports（导入）/contains（包含）/defines（定义）
+- **跨文件解析**：外部符号引用自动解析为实际节点 id
+- **自然语言查询**：支持调用者/被调用者/子类/父类/定义位置/模块函数/类方法/调用链 8 种查询模式
+- **中文标识符提取**：从中文问句中提取代码标识符（支持引号/点号分隔/驼峰）
+- **工具注册**：`code_graph_index`/`code_graph_query`/`code_graph_stats` 注册到 TOOL_MAP
+
+### 新增 - 阶段 R（Zig 加速层深度优化）
+- **SIMD 字符比较**：`zig_simd_find_diff` 使用 @Vector(32, u8) 并行比较，大缓冲区 32 字节/周期
+- **SIMD 样式比较**：`zig_simd_find_style_diff` 将 StyleStruct 视为 u64，4x u64 向量比较
+- **UTF-8 字符计数**：`zig_utf8_char_count` 零拷贝计算 UTF-8 字符数（支持中文/混合）
+- **批量填充**：`zig_fill_chars`/`zig_fill_styles` 批量填充缓冲区
+- **Python 绑定**：`_zig_bindings.py` 配置 R 阶段 5 个新函数的 ctypes 签名，失败回退到 Python
+
+### 新增 - 阶段 S（工具调用并行化）
+- **ParallelToolScheduler**：并行工具调度器，asyncio.Semaphore 并发控制，单工具超时隔离
+- **ToolDependencyGraph**：工具依赖图，静态分析读写依赖，拓扑排序分批执行
+- **ResultMerger**：结果合并器，支持 concat/dict/list/priority 4 种合并策略
+- **AgentLoop 集成**：新增 `enable_parallel_tools`/`max_concurrency` 参数，`execute_tools_parallel()` 方法
+
+### 新增 - 阶段 T（内存与性能优化）
+- **VectorCompressor**：向量压缩器，float32→float16 节省 50% 内存，支持 int8 量化
+- **UnifiedCacheManager**：统一缓存管理器，多缓存实例，LRU 淘汰，内存预算分配
+- **IncrementalIndexer**：增量索引器，基于 mtime+content_hash 精准增量更新，JSON 持久化
+- **ContextBudgetAllocator**：上下文窗口 token 预算分配器，按优先级分配（answer 40% / tool_result 30% / thought 20% / history 10%）
+
+### 变更
+- **pyproject.toml**：添加 `[tool.pytest.ini_options]` 配置 pytest-asyncio auto 模式，禁用 xonsh 插件
+- **core/__init__.py**：导出 N/O/P/Q/R/S/T 阶段所有新模块符号
+
+### 测试
+- **test_nopq_stages.py**：8 大场景测试（沙箱/消息总线/流式思维链/AgentLoop 集成/知识图谱/自然语言查询/工具集成）
+- **回归测试**：59 项既有测试全部通过（react_agent + mcp_stages + mcp_integration + agent_g_stage）
+
 ## [1.1.3] - 2026-07-28
 
 ### 新增

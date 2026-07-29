@@ -222,6 +222,30 @@ from .code_knowledge_graph import (
     reset_code_knowledge_graph,
 )
 
+# 阶段 S：工具调用并行化
+from .parallel_tools import (
+    ToolCallRequest,
+    ToolCallResult,
+    ToolDependencyGraph,
+    ResultMerger,
+    ParallelToolScheduler,
+    get_parallel_scheduler,
+    reset_parallel_scheduler,
+)
+
+# 阶段 T：内存与性能优化
+from .memory_optimizer import (
+    VectorCompressor,
+    CacheStats,
+    UnifiedCacheManager,
+    FileIndexEntry,
+    IncrementalIndexer,
+    ContextBudgetAllocator,
+    get_unified_cache_manager,
+    get_incremental_indexer,
+    reset_memory_optimizers,
+)
+
 __all__ = [
     # 原有模块
     "get_config", "load_config",
@@ -297,4 +321,12 @@ __all__ = [
     # 阶段 Q：项目代码知识图谱
     "CodeNode", "CodeEdge", "CodeKnowledgeGraph",
     "get_code_knowledge_graph", "reset_code_knowledge_graph",
+    # 阶段 S：工具调用并行化
+    "ToolCallRequest", "ToolCallResult", "ToolDependencyGraph",
+    "ResultMerger", "ParallelToolScheduler",
+    "get_parallel_scheduler", "reset_parallel_scheduler",
+    # 阶段 T：内存与性能优化
+    "VectorCompressor", "CacheStats", "UnifiedCacheManager",
+    "FileIndexEntry", "IncrementalIndexer", "ContextBudgetAllocator",
+    "get_unified_cache_manager", "get_incremental_indexer", "reset_memory_optimizers",
 ]

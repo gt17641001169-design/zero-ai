@@ -523,3 +523,251 @@ test "zig_diff_buffers with style" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\x1b[1m") != null); // bold
     try std.testing.expect(std.mem.indexOf(u8, result, "\x1b[31m") != null); // red fg
 }
+
+// ============================================================================
+// 阶段 R.1：SIMD 优化的字符缓冲区比较
+// ============================================================================
+//
+// 对纯字符数组的快速比较，使用 @Vector 和 SIMD 指令加速。
+// 当缓冲区足够大（>= 32 字节）时，使用 8x u32 向量并行比较；
+// 小缓冲区回退到逐字节比较。
+//
+// 返回第一个差异位置的索引，没有差异返回 len。
+
+export fn zig_simd_find_diff(
+    a: [*]const u8,
+    b: [*]const u8,
+    len: usize,
+) usize {
+    if (len == 0) return 0;
+
+    // 小缓冲区直接逐字节比较
+    if (len < 32) {
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            if (a[i] != b[i]) return i;
+        }
+        return len;
+    }
+
+    // SIMD 向量比较：每次 32 字节
+    const Vec = @Vector(32, u8);
+    var i: usize = 0;
+    while (i + 32 <= len) : (i += 32) {
+        const va: Vec = a[i .. i + 32][0..32].*;
+        const vb: Vec = b[i .. i + 32][0..32].*;
+        const cmp: @Vector(32, bool) = va != vb;
+        // 用 @reduce 检查是否有任何差异
+        if (@reduce(.Or, cmp)) {
+            // 回退到逐字节检查这段，找到精确位置
+            var j: usize = 0;
+            while (j < 32) : (j += 1) {
+                if (a[i + j] != b[i + j]) return i + j;
+            }
+        }
+    }
+
+    // 处理剩余不足 32 字节的尾部
+    while (i < len) : (i += 1) {
+        if (a[i] != b[i]) return i;
+    }
+    return len;
+}
+
+// ============================================================================
+// 阶段 R.2：批量样式比较（SIMD 加速）
+// ============================================================================
+//
+// 对 StyleStruct 数组进行批量比较，返回第一个差异索引。
+// StyleStruct 是 8 字节，可一次比较 4 个（32 字节向量）。
+
+export fn zig_simd_find_style_diff(
+    a: [*]const StyleStruct,
+    b: [*]const StyleStruct,
+    len: usize,
+) usize {
+    if (len == 0) return 0;
+
+    // 将 StyleStruct 视为 u64 进行比较
+    const a_ptr: [*]const u64 = @ptrCast(a);
+    const b_ptr: [*]const u64 = @ptrCast(b);
+
+    // 小数组直接比较
+    if (len < 16) {
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            if (a_ptr[i] != b_ptr[i]) return i;
+        }
+        return len;
+    }
+
+    // 4x u64 向量比较（32 字节）
+    const Vec = @Vector(4, u64);
+    var i: usize = 0;
+    while (i + 4 <= len) : (i += 4) {
+        const va: Vec = a_ptr[i .. i + 4][0..4].*;
+        const vb: Vec = b_ptr[i .. i + 4][0..4].*;
+        const cmp: @Vector(4, bool) = va != vb;
+        if (@reduce(.Or, cmp)) {
+            // 找到具体位置
+            var j: usize = 0;
+            while (j < 4) : (j += 1) {
+                if (a_ptr[i + j] != b_ptr[i + j]) return i + j;
+            }
+        }
+    }
+
+    // 尾部
+    while (i < len) : (i += 1) {
+        if (a_ptr[i] != b_ptr[i]) return i;
+    }
+    return len;
+}
+
+// ============================================================================
+// 阶段 R.3：零拷贝 UTF-8 长度计算
+// ============================================================================
+//
+// 快速计算 UTF-8 字符串的字符数（不含多字节序列的字节数）。
+// 用于光标位置计算，避免逐字节循环。
+
+export fn zig_utf8_char_count(
+    bytes: [*]const u8,
+    len: usize,
+) usize {
+    if (len == 0) return 0;
+
+    var count: usize = 0;
+    var i: usize = 0;
+
+    while (i < len) {
+        const b = bytes[i];
+        // UTF-8 起始字节：0xxxxxxx (1字节) / 110xxxxx (2字节) /
+        //               1110xxxx (3字节) / 11110xxx (4字节)
+        // 后续字节：10xxxxxx
+        if (b < 0x80) {
+            // ASCII
+            count += 1;
+            i += 1;
+        } else if (b < 0xC0) {
+            // 后续字节，跳过（不应出现，但容错）
+            i += 1;
+        } else if (b < 0xE0) {
+            count += 1;
+            i += 2;
+        } else if (b < 0xF0) {
+            count += 1;
+            i += 3;
+        } else {
+            count += 1;
+            i += 4;
+        }
+    }
+    return count;
+}
+
+// ============================================================================
+// 阶段 R.4：批量填充字符缓冲区（SIMD 加速 memset）
+// ============================================================================
+
+export fn zig_fill_chars(
+    buf: [*]u8,
+    len: usize,
+    value: u8,
+) void {
+    if (len == 0) return;
+    @memset(buf[0..len], value);
+}
+
+// ============================================================================
+// 阶段 R.5：批量填充样式缓冲区
+// ============================================================================
+
+export fn zig_fill_styles(
+    buf: [*]StyleStruct,
+    len: usize,
+    style: StyleStruct,
+) void {
+    if (len == 0) return;
+    @memset(buf[0..len], style);
+}
+
+// ============================================================================
+// 单元测试 - R 阶段新增函数
+// ============================================================================
+
+test "zig_simd_find_diff identical" {
+    const a = [_]u8{ 'a', 'b', 'c', 'd' } ** 8; // 32 字节
+    const b = [_]u8{ 'a', 'b', 'c', 'd' } ** 8;
+    const idx = zig_simd_find_diff(&a, &b, a.len);
+    try std.testing.expectEqual(@as(usize, 32), idx);
+}
+
+test "zig_simd_find_diff first_byte" {
+    var a = [_]u8{'x'} ** 32;
+    var b = [_]u8{'y'} ** 32;
+    const idx = zig_simd_find_diff(&a, &b, a.len);
+    try std.testing.expectEqual(@as(usize, 0), idx);
+}
+
+test "zig_simd_find_diff middle" {
+    var a = [_]u8{'x'} ** 32;
+    var b = [_]u8{'x'} ** 32;
+    b[15] = 'y';
+    const idx = zig_simd_find_diff(&a, &b, a.len);
+    try std.testing.expectEqual(@as(usize, 15), idx);
+}
+
+test "zig_simd_find_diff small_buffer" {
+    const a = [_]u8{ 'a', 'b', 'c' };
+    const b = [_]u8{ 'a', 'X', 'c' };
+    const idx = zig_simd_find_diff(&a, &b, a.len);
+    try std.testing.expectEqual(@as(usize, 1), idx);
+}
+
+test "zig_simd_find_style_diff identical" {
+    const a = [_]StyleStruct{.{}} ** 16;
+    const b = [_]StyleStruct{.{}} ** 16;
+    const idx = zig_simd_find_style_diff(&a, &b, a.len);
+    try std.testing.expectEqual(@as(usize, 16), idx);
+}
+
+test "zig_simd_find_style_diff difference" {
+    var a = [_]StyleStruct{.{}} ** 16;
+    var b = [_]StyleStruct{.{}} ** 16;
+    b[7] = .{ .bold = 1 };
+    const idx = zig_simd_find_style_diff(&a, &b, a.len);
+    try std.testing.expectEqual(@as(usize, 7), idx);
+}
+
+test "zig_utf8_char_count ascii" {
+    const s = "Hello, World!";
+    const count = zig_utf8_char_count(s.ptr, s.len);
+    try std.testing.expectEqual(@as(usize, 13), count);
+}
+
+test "zig_utf8_char_count chinese" {
+    const s = "你好世界"; // 4 个汉字，12 字节
+    const count = zig_utf8_char_count(s.ptr, s.len);
+    try std.testing.expectEqual(@as(usize, 4), count);
+}
+
+test "zig_utf8_char_count mixed" {
+    const s = "Hi你好"; // 2 ASCII + 2 中文 = 4 字符，8 字节
+    const count = zig_utf8_char_count(s.ptr, s.len);
+    try std.testing.expectEqual(@as(usize, 4), count);
+}
+
+test "zig_fill_chars" {
+    var buf = [_]u8{ 'x', 'y', 'z', 'w' };
+    zig_fill_chars(&buf, buf.len, ' ');
+    try std.testing.expectEqual(@as(u8, ' '), buf[0]);
+    try std.testing.expectEqual(@as(u8, ' '), buf[3]);
+}
+
+test "zig_fill_styles" {
+    var buf = [_]StyleStruct{ .{ .bold = 1 }, .{ .fg_id = 5 } } ** 4;
+    zig_fill_styles(&buf, buf.len, .{});
+    try std.testing.expectEqual(@as(u8, 0), buf[0].bold);
+    try std.testing.expectEqual(@as(i16, -1), buf[1].fg_id);
+}

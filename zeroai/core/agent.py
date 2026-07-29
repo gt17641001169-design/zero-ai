@@ -361,6 +361,8 @@ class AgentLoop:
         enable_mcp_health_check: bool = False,
         enable_progress_tracker: bool = False,
         enable_streaming_thought: bool = False,
+        enable_parallel_tools: bool = False,
+        max_concurrency: int = 4,
     ):
         """初始化 Agent Loop
 
@@ -383,6 +385,9 @@ class AgentLoop:
             enable_streaming_thought: 是否启用流式思维链输出（阶段 P.2）
                                       启用后 on_thought 回调会被流式发射器包装，
                                       支持增量输出
+            enable_parallel_tools: 是否启用工具并行调用（阶段 S）
+                                   启用后支持单步多工具并行执行
+            max_concurrency: 最大并发工具数（阶段 S，默认 4）
         """
         self.planner = planner or ReActPlanner()
         if tool_map is None or tools_schema is None:
@@ -420,6 +425,20 @@ class AgentLoop:
             except Exception:
                 self._streaming_emitter = None
                 self._interrupt_handler = None
+
+        # 阶段 S：并行工具调度
+        self.enable_parallel_tools = enable_parallel_tools
+        self.max_concurrency = max_concurrency
+        self._parallel_scheduler = None
+        if enable_parallel_tools:
+            try:
+                from .parallel_tools import ParallelToolScheduler
+                self._parallel_scheduler = ParallelToolScheduler(
+                    tool_map=self.tool_map,
+                    max_concurrency=max_concurrency,
+                )
+            except Exception:
+                self._parallel_scheduler = None
 
         # 回调钩子（UI 层注册）
         self.on_thought: Optional[Callable[[str], Awaitable[None]]] = None
@@ -829,6 +848,49 @@ class AgentLoop:
             return self._progress_tracker.get_stats()
         except Exception:
             return {}
+
+    async def execute_tools_parallel(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        merge_strategy: str = "concat",
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """并行执行多个工具调用（阶段 S）
+
+        Args:
+            tool_calls: 工具调用列表，每个元素是 {"name": ..., "args": ...}
+            merge_strategy: 结果合并策略（concat/dict/list/priority）
+
+        Returns:
+            (合并后的结果字符串, 详细结果列表)
+        """
+        if not self._parallel_scheduler:
+            # 未启用并行调度器，回退到串行执行
+            results = []
+            for tc in tool_calls:
+                name = tc.get("name", "")
+                args = tc.get("args", {})
+                result = await self._execute_tool(name, args)
+                results.append({
+                    "name": name,
+                    "args": args,
+                    "result": result,
+                    "success": not result.startswith("[错误]"),
+                })
+            merged = "\n\n".join(f"[{r['name']}] {r['result']}" for r in results)
+            return merged, results
+
+        from .parallel_tools import ToolCallRequest
+        requests = [
+            ToolCallRequest(
+                name=tc.get("name", ""),
+                args=tc.get("args", {}),
+                timeout=tc.get("timeout"),
+            )
+            for tc in tool_calls
+        ]
+        results = await self._parallel_scheduler.execute_parallel(requests)
+        merged = self._parallel_scheduler.merge_results(results, strategy=merge_strategy)
+        return merged, [r.to_dict() for r in results]
 
 
 # ============================================================================

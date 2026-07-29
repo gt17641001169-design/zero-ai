@@ -318,6 +318,51 @@ def _load_zig_lib():
         _zig_load_error = f"signature config failed: {e}"
         return None
 
+    # 阶段 R：配置 SIMD 加速函数签名
+    try:
+        # zig_simd_find_diff(a, b, len) -> usize
+        lib.zig_simd_find_diff.argtypes = [
+            ctypes.c_char_p,    # a
+            ctypes.c_char_p,    # b
+            ctypes.c_size_t,    # len
+        ]
+        lib.zig_simd_find_diff.restype = ctypes.c_size_t
+
+        # zig_simd_find_style_diff(a, b, len) -> usize
+        lib.zig_simd_find_style_diff.argtypes = [
+            ctypes.POINTER(StyleStruct),   # a
+            ctypes.POINTER(StyleStruct),   # b
+            ctypes.c_size_t,               # len
+        ]
+        lib.zig_simd_find_style_diff.restype = ctypes.c_size_t
+
+        # zig_utf8_char_count(bytes, len) -> usize
+        lib.zig_utf8_char_count.argtypes = [
+            ctypes.c_char_p,    # bytes
+            ctypes.c_size_t,    # len
+        ]
+        lib.zig_utf8_char_count.restype = ctypes.c_size_t
+
+        # zig_fill_chars(buf, len, value) -> void
+        lib.zig_fill_chars.argtypes = [
+            ctypes.c_char_p,    # buf
+            ctypes.c_size_t,    # len
+            ctypes.c_uint8,     # value
+        ]
+        lib.zig_fill_chars.restype = None
+
+        # zig_fill_styles(buf, len, style) -> void
+        lib.zig_fill_styles.argtypes = [
+            ctypes.POINTER(StyleStruct),   # buf
+            ctypes.c_size_t,               # len
+            StyleStruct,                    # style
+        ]
+        lib.zig_fill_styles.restype = None
+    except Exception as e:
+        # R 阶段函数签名配置失败不阻断主流程，仅记录
+        # 这些函数为可选加速，缺失时回退到 Python 实现
+        pass
+
     _zig_load_error = None
     return lib
 
