@@ -15205,37 +15205,17 @@ class ZeroAI(App):
                                     self._add_static(Text("  └─ ⚠️ 检测到模型重复输出，已自动截断", style="bold yellow"))
                                     break
                             # 额外防御：单 chunk 内出现大量重复标记（如 <回答> 链、用户回应链）
-                            _dup_markers = ["<回答>", "用户回应", "function_calling"]
-                            for _dm in _dup_markers:
-                                if _dm in content_chunk and content_chunk.count(_dm) >= 4:
-                                    _loop_detected = True
-                                    full_content += "\n[系统自动截断：检测到重复标记链]"
-                                    self._add_static(Text("  └─ ⚠️ 检测到重复标记链，已自动截断", style="bold yellow"))
-                                    break
-                            if _loop_detected:
+                            # 仅检查标记字符串，不做通用短子串扫描（避免 O(n²) 拖慢流式输出）
+                            if "<回答>" in content_chunk and content_chunk.count("<回答>") >= 4:
+                                _loop_detected = True
+                                full_content += "\n[系统自动截断：检测到重复标记链]"
+                                self._add_static(Text("  └─ ⚠️ 检测到重复标记链，已自动截断", style="bold yellow"))
                                 break
-                            # 通用防御：末尾 200 字符内短子串高频重复
-                            if len(full_content) >= 200:
-                                _tail = full_content[-200:]
-                                _repeated = False
-                                for _sub_len in range(3, 16):
-                                    _sub_counts = {}
-                                    for _i in range(len(_tail) - _sub_len + 1):
-                                        _sub = _tail[_i:_i + _sub_len]
-                                        if any(c.isspace() for c in _sub):
-                                            continue
-                                        _sub_counts[_sub] = _sub_counts.get(_sub, 0) + 1
-                                    if _sub_counts:
-                                        _max_sub, _max_cnt = max(_sub_counts.items(), key=lambda x: x[1])
-                                        _threshold = max(5, 150 // _sub_len)
-                                        if _max_cnt >= _threshold:
-                                            _repeated = True
-                                            break
-                                if _repeated:
-                                    _loop_detected = True
-                                    full_content += "\n[系统自动截断：检测到循环内容]"
-                                    self._add_static(Text("  └─ ⚠️ 检测到循环内容，已自动截断", style="bold yellow"))
-                                    break
+                            if "用户回应" in content_chunk and content_chunk.count("用户回应") >= 4:
+                                _loop_detected = True
+                                full_content += "\n[系统自动截断：检测到重复标记链]"
+                                self._add_static(Text("  └─ ⚠️ 检测到重复标记链，已自动截断", style="bold yellow"))
+                                break
                         update_counter += 1
                         # 统计 token（每个 chunk 约 1 token）
                         self.stream_token_count += 1
