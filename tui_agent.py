@@ -15189,33 +15189,31 @@ class ZeroAI(App):
 
                     if delta.content:
                         full_content += delta.content
-                        # 过滤模型内部特殊标签（<|observation|> <|system|> 等，防止泄露给用户）
-                        full_content = _strip_model_tokens(full_content)
-                        # 内容层循环检测：连续 N 个 chunk 内容相同且非空，判定为模型陷入重复
+                        # 内容层循环检测：采样检测（每 5 个 chunk 检测一次，避免拖慢流式输出）
                         content_chunk = delta.content.strip()
                         if content_chunk:
                             _content_loop_buf.append(content_chunk)
                             if len(_content_loop_buf) > _content_loop_window:
                                 _content_loop_buf.pop(0)
-                            if len(_content_loop_buf) >= _content_loop_threshold:
+                            if update_counter % 5 == 0 and len(_content_loop_buf) >= _content_loop_threshold:
                                 recent = _content_loop_buf[-_content_loop_threshold:]
                                 if len(set(recent)) <= 1 and len(recent[0]) >= 2:
                                     _loop_detected = True
                                     full_content += "\n[系统自动截断：检测到重复输出]"
                                     self._add_static(Text("  └─ ⚠️ 检测到模型重复输出，已自动截断", style="bold yellow"))
                                     break
-                            # 额外防御：单 chunk 内出现大量重复标记（如 <回答> 链、用户回应链）
-                            # 仅检查标记字符串，不做通用短子串扫描（避免 O(n²) 拖慢流式输出）
-                            if "<回答>" in content_chunk and content_chunk.count("<回答>") >= 4:
-                                _loop_detected = True
-                                full_content += "\n[系统自动截断：检测到重复标记链]"
-                                self._add_static(Text("  └─ ⚠️ 检测到重复标记链，已自动截断", style="bold yellow"))
-                                break
-                            if "用户回应" in content_chunk and content_chunk.count("用户回应") >= 4:
-                                _loop_detected = True
-                                full_content += "\n[系统自动截断：检测到重复标记链]"
-                                self._add_static(Text("  └─ ⚠️ 检测到重复标记链，已自动截断", style="bold yellow"))
-                                break
+                            # 标记链检测（轻量，仅 count 操作）
+                            if update_counter % 5 == 0:
+                                if "<回答>" in content_chunk and content_chunk.count("<回答>") >= 4:
+                                    _loop_detected = True
+                                    full_content += "\n[系统自动截断：检测到重复标记链]"
+                                    self._add_static(Text("  └─ ⚠️ 检测到重复标记链，已自动截断", style="bold yellow"))
+                                    break
+                                if "用户回应" in content_chunk and content_chunk.count("用户回应") >= 4:
+                                    _loop_detected = True
+                                    full_content += "\n[系统自动截断：检测到重复标记链]"
+                                    self._add_static(Text("  └─ ⚠️ 检测到重复标记链，已自动截断", style="bold yellow"))
+                                    break
                         update_counter += 1
                         # 统计 token（每个 chunk 约 1 token）
                         self.stream_token_count += 1
@@ -15246,7 +15244,8 @@ class ZeroAI(App):
                                 self.stream_token_count += 1
                                 self.total_tokens += 1
 
-                # 最终更新：分离 think 和 body，合并所有思考内容
+                # 最终更新：一次性过滤模型内部标签（流式期间不过滤，避免 O(n²) 拖慢）
+                full_content = _strip_model_tokens(full_content)
                 think_in_content, body_content = _parse_think_tags(full_content)
                 combined_reasoning = (reasoning_content + ("\n" + think_in_content if think_in_content else "")).strip()
                 if combined_reasoning:
