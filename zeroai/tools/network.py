@@ -228,11 +228,80 @@ def open_app(name: str) -> str:
             return f"启动失败：{e}"
 
 
+def _ddg_search(query: str, num_results: int = 5) -> list:
+    """DuckDuckGo HTML 搜索（完全免费、无需 API Key）
+
+    返回结构化结果列表：[{"title": ..., "url": ..., "snippet": ...}, ...]
+    DuckDuckGo 不会因地区限制而不可达，且 HTML 结构稳定。
+    """
+    _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36"
+    q = urllib.parse.quote_plus(query)
+    # DuckDuckGo HTML 端点（轻量、无 JS 依赖）
+    url = f"https://html.duckduckgo.com/html/?q={q}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    })
+    results = []
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        # DuckDuckGo HTML 结果块：<a class="result__a" href="...">title</a>
+        # snippet: <a class="result__snippet" ...>...</a>
+        blocks = re.findall(
+            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+            r'[\s\S]*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+            html, re.DOTALL
+        )
+        for link_raw, title_raw, snippet_raw in blocks[:num_results]:
+            # DuckDuckGo 的链接是跳转链接，需要提取真实 URL
+            # 格式: //duckduckgo.com/l/?uddg=ENCODED_URL&...
+            if "uddg=" in link_raw:
+                uddg = re.search(r'uddg=([^&]+)', link_raw)
+                if uddg:
+                    link = urllib.parse.unquote(uddg.group(1))
+                else:
+                    link = link_raw
+            else:
+                link = link_raw
+            if link.startswith("//"):
+                link = "https:" + link
+            title = re.sub(r"<[^>]+>", "", title_raw).strip()
+            snippet = re.sub(r"<[^>]+>", "", snippet_raw).strip()
+            if title and link.startswith("http") and len(title) > 2:
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "snippet": snippet[:200] if snippet else "",
+                })
+    except Exception:
+        pass
+    return results
+
+
 def web_search(query: str, num_results: int = 5) -> str:
-    """网络搜索（百度优先，Bing CN 备用，Bing 国际版第三）
+    """网络搜索（DuckDuckGo 优先，百度/Bing 备用）
+
+    升级说明：
+    - 主搜索源改为 DuckDuckGo（完全免费、无需 API Key、HTML 结构稳定）
+    - 返回结构化结果：标题 + URL + 摘要
+    - 百度/Bing 作为 fallback，确保国内可用性
 
     迁移来源：tui_agent.py 行 2951-3042
     """
+    # ── 方案0：DuckDuckGo（免费、无需 Key、稳定）──
+    ddg_results = _ddg_search(query, num_results)
+    if ddg_results:
+        lines = []
+        for i, r in enumerate(ddg_results, 1):
+            line = f"{i}. {r['title']}\n   URL: {r['url']}"
+            if r['snippet']:
+                line += f"\n   摘要: {r['snippet']}"
+            lines.append(line)
+        return "\n\n".join(lines)
+
+    # ── fallback：百度/Bing 抓取（原逻辑保留）──
     q = urllib.parse.quote(query)
     _FILTERS_BAIDU = ("baidu.com", "baidustatic", "bdstatic", "baiduimg",
                       "baidupcs", "bcebos", "baiducontent")
