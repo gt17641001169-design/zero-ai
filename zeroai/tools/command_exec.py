@@ -348,3 +348,195 @@ def pip_install(package: str, action: str = "install") -> str:
         return "错误：操作超时"
     except Exception as e:
         return f"错误：{e}"
+
+
+def code_execute(
+    code: str,
+    timeout: int = 10,
+    stdin_input: str = "",
+) -> str:
+    """在安全沙箱中执行 Python 代码（阶段 N.2）
+
+    使用 AST 静态分析 + 子进程隔离的双重保护：
+    1. 代码安全检查：AST 遍历，拒绝危险调用（os.system/subprocess 等）
+    2. 子进程隔离：在独立进程中执行，崩溃不影响主进程
+    3. 资源限制：超时、内存限制
+    4. 网络隔离：默认禁用网络访问
+
+    与 exec_python 的区别：
+    - exec_python：字符串黑名单 + 同进程 exec（较弱）
+    - code_execute：AST 分析 + 子进程隔离（更强）
+
+    Args:
+        code: Python 代码
+        timeout: 超时秒数（1-60）
+        stdin_input: 标准输入内容
+
+    Returns:
+        执行结果（stdout + stderr + 错误信息）
+    """
+    from zeroai.core.sandbox import CodeSandbox
+
+    # 参数校验
+    if not code or not code.strip():
+        return "错误：代码为空"
+
+    timeout = max(1, min(int(timeout), 60))
+
+    sandbox = CodeSandbox(
+        timeout=timeout,
+        max_memory_mb=256,
+        allow_network=False,
+    )
+    result = sandbox.execute(code, stdin_input=stdin_input or None)
+
+    # 格式化输出
+    parts = []
+    if result.get("issues"):
+        parts.append("安全检查问题：")
+        for issue in result["issues"]:
+            parts.append(f"  - {issue}")
+        return "\n".join(parts)
+
+    if result.get("stdout"):
+        parts.append(result["stdout"].strip())
+
+    if result.get("stderr"):
+        parts.append(f"[stderr]\n{result['stderr'].strip()}")
+
+    if result.get("error"):
+        parts.append(f"[错误] {result['error']}")
+
+    parts.append(f"[耗时] {result.get('duration', 0):.2f}s")
+
+    output = "\n".join(parts).strip()
+    return output if output else "(无输出)"
+
+
+def code_check(code: str) -> str:
+    """检查 Python 代码安全性（阶段 N.2，不执行）
+
+    Args:
+        code: Python 代码
+
+    Returns:
+        安全检查结果
+    """
+    from zeroai.core.sandbox import check_code_safety
+
+    is_safe, issues = check_code_safety(code)
+    if is_safe:
+        return "代码安全检查通过"
+    else:
+        return "代码安全检查未通过：\n" + "\n".join(f"  - {i}" for i in issues)
+
+
+def code_graph_index(path: str = "") -> str:
+    """构建项目代码知识图谱（阶段 Q.1）
+
+    扫描指定目录下的 Python 文件，使用 AST 解析构建代码知识图谱，
+    提取模块/类/函数节点及调用/继承/导入关系。
+
+    Args:
+        path: 项目目录路径，默认当前目录
+
+    Returns:
+        索引统计信息
+    """
+    from zeroai.core.code_knowledge_graph import get_code_knowledge_graph
+
+    if not path:
+        path = os.getcwd()
+
+    if not os.path.isdir(path):
+        return f"错误：目录不存在 {path}"
+
+    graph = get_code_knowledge_graph()
+    graph.clear()  # 清空旧索引
+    stats = graph.index_directory(path)
+
+    lines = [
+        f"代码知识图谱构建完成（阶段 Q.1）",
+        f"  扫描文件: {stats['total_files']} 个",
+        f"  已索引文件: {stats['indexed_files']} 个",
+        f"  节点总数: {stats['total_nodes']} 个",
+        f"  边总数: {stats['total_edges']} 条",
+        f"  耗时: {stats['elapsed']} 秒",
+    ]
+
+    # 附加详细统计
+    detail = graph.get_stats()
+    if detail.get("node_types"):
+        lines.append("  节点类型分布:")
+        for t, c in sorted(detail["node_types"].items(), key=lambda x: -x[1]):
+            lines.append(f"    {t}: {c}")
+    if detail.get("edge_types"):
+        lines.append("  边类型分布:")
+        for t, c in sorted(detail["edge_types"].items(), key=lambda x: -x[1]):
+            lines.append(f"    {t}: {c}")
+
+    return "\n".join(lines)
+
+
+def code_graph_query(question: str) -> str:
+    """自然语言查询代码结构（阶段 Q.2）
+
+    基于已构建的代码知识图谱，回答关于代码结构的自然语言问题。
+
+    支持的查询模式：
+    - 谁调用了 X / X 的调用者
+    - X 调用了谁 / X 的被调用者
+    - X 的子类 / 继承自 X 的类
+    - X 的父类 / X 的基类
+    - X 定义在哪里 / X 的定义位置
+    - X 模块有哪些函数
+    - X 类有哪些方法
+    - X 的调用链
+
+    Args:
+        question: 自然语言问题
+
+    Returns:
+        查询答案
+    """
+    from zeroai.core.code_knowledge_graph import get_code_knowledge_graph
+
+    if not question or not question.strip():
+        return "错误：查询问题为空"
+
+    graph = get_code_knowledge_graph()
+    if not graph.nodes:
+        return "错误：代码知识图谱为空，请先调用 code_graph_index 构建索引"
+
+    return graph.query(question)
+
+
+def code_graph_stats() -> str:
+    """获取代码知识图谱统计信息（阶段 Q.2）
+
+    Returns:
+        统计信息字符串
+    """
+    from zeroai.core.code_knowledge_graph import get_code_knowledge_graph
+
+    graph = get_code_knowledge_graph()
+    if not graph.nodes:
+        return "代码知识图谱为空，请先调用 code_graph_index 构建索引"
+
+    stats = graph.get_stats()
+    lines = [
+        f"代码知识图谱统计：",
+        f"  节点总数: {stats['total_nodes']}",
+        f"  边总数: {stats['total_edges']}",
+        f"  已索引模块: {stats['modules_indexed']}",
+        f"  已解析外部引用: {stats['external_resolved']}",
+    ]
+    if stats.get("node_types"):
+        lines.append("  节点类型分布:")
+        for t, c in sorted(stats["node_types"].items(), key=lambda x: -x[1]):
+            lines.append(f"    {t}: {c}")
+    if stats.get("edge_types"):
+        lines.append("  边类型分布:")
+        for t, c in sorted(stats["edge_types"].items(), key=lambda x: -x[1]):
+            lines.append(f"    {t}: {c}")
+    return "\n".join(lines)

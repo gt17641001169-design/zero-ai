@@ -359,6 +359,8 @@ class AgentLoop:
         use_mcp: bool = False,
         enable_audit: bool = True,
         enable_mcp_health_check: bool = False,
+        enable_progress_tracker: bool = False,
+        enable_streaming_thought: bool = False,
     ):
         """初始化 Agent Loop
 
@@ -375,6 +377,12 @@ class AgentLoop:
                           启用后所有工具调用自动记录到 MCPAuditLogger
             enable_mcp_health_check: 是否启用 MCP 健康检查（阶段 J.3）
                                      启用后 MCP 工具调用前先检查服务器健康状态
+            enable_progress_tracker: 是否启用工具调用进度跟踪（阶段 P.2）
+                                     启用后工具调用自动注册到 ProgressTracker，
+                                     UI 层可实时渲染进度条
+            enable_streaming_thought: 是否启用流式思维链输出（阶段 P.2）
+                                      启用后 on_thought 回调会被流式发射器包装，
+                                      支持增量输出
         """
         self.planner = planner or ReActPlanner()
         if tool_map is None or tools_schema is None:
@@ -392,6 +400,27 @@ class AgentLoop:
         self.enable_audit = enable_audit
         self.enable_mcp_health_check = enable_mcp_health_check
 
+        # 阶段 P.2：流式输出与进度跟踪
+        self.enable_progress_tracker = enable_progress_tracker
+        self.enable_streaming_thought = enable_streaming_thought
+        self._progress_tracker = None
+        self._streaming_emitter = None
+        self._interrupt_handler = None
+        if enable_progress_tracker:
+            try:
+                from .streaming import get_progress_tracker
+                self._progress_tracker = get_progress_tracker()
+            except Exception:
+                self._progress_tracker = None
+        if enable_streaming_thought:
+            try:
+                from .streaming import get_streaming_emitter, get_interrupt_handler
+                self._streaming_emitter = get_streaming_emitter()
+                self._interrupt_handler = get_interrupt_handler()
+            except Exception:
+                self._streaming_emitter = None
+                self._interrupt_handler = None
+
         # 回调钩子（UI 层注册）
         self.on_thought: Optional[Callable[[str], Awaitable[None]]] = None
         self.on_tool_call: Optional[Callable[[str, Dict], Awaitable[None]]] = None
@@ -401,12 +430,23 @@ class AgentLoop:
         self.is_stopped: Optional[Callable[[], bool]] = None
 
     def _check_stopped(self) -> bool:
-        """检查是否被用户中断"""
+        """检查是否被用户中断
+
+        阶段 P.2：同时检查流式中断处理器（InterruptionHandler）
+        """
         if self.is_stopped:
             try:
-                return bool(self.is_stopped())
+                if bool(self.is_stopped()):
+                    return True
             except Exception:
-                return False
+                pass
+        # 阶段 P.2：流式中断处理器检查
+        if self._interrupt_handler is not None:
+            try:
+                if self._interrupt_handler.check():
+                    return True
+            except Exception:
+                pass
         return False
 
     async def _execute_tool(self, name: str, args: Dict[str, Any]) -> str:
@@ -592,9 +632,21 @@ class AgentLoop:
 
         Returns:
             (final_answer, executed_steps)
+
+        阶段 P.2 增强：
+        - 流式思维链：通过 StreamingThoughtEmitter 实时输出思考过程
+        - 进度跟踪：通过 ProgressTracker 跟踪工具调用进度
+        - 中断响应：通过 InterruptionHandler 支持用户中断
         """
         executed_steps: List[Dict[str, Any]] = []
         final_answer = ""
+
+        # 阶段 P.2：流式思维链开始
+        if self._streaming_emitter is not None:
+            try:
+                self._streaming_emitter.start_thought(f"任务: {user_input[:50]}")
+            except Exception:
+                pass
 
         for step in range(1, self.max_steps + 1):
             if self._check_stopped():
@@ -612,6 +664,13 @@ class AgentLoop:
             thought = plan.get("thought", "")
             action = plan.get("next_action", {})
             task_complete = plan.get("task_complete", False)
+
+            # 阶段 P.2：流式输出思考内容
+            if self._streaming_emitter is not None:
+                try:
+                    self._streaming_emitter.append_chunk(f"[步 {step}] {thought}")
+                except Exception:
+                    pass
 
             if self.on_thought:
                 try:
@@ -634,7 +693,26 @@ class AgentLoop:
                     except Exception:
                         pass
 
+                # 阶段 P.2：进度跟踪 - 开始
+                call_id = None
+                if self._progress_tracker is not None:
+                    try:
+                        call_id = self._progress_tracker.start(tool_name, tool_args)
+                        self._progress_tracker.update(call_id, progress=0.1, message="启动工具")
+                    except Exception:
+                        call_id = None
+
                 result = await self._execute_tool(tool_name, tool_args)
+
+                # 阶段 P.2：进度跟踪 - 完成/失败
+                if self._progress_tracker is not None and call_id is not None:
+                    try:
+                        if result.startswith("[错误]") or result.startswith("[MCP 调度错误]"):
+                            self._progress_tracker.fail(call_id, error=result[:200])
+                        else:
+                            self._progress_tracker.complete(call_id, result=result[:200])
+                    except Exception:
+                        pass
 
                 if self.on_tool_result:
                     try:
@@ -660,6 +738,13 @@ class AgentLoop:
                     "role": "user",
                     "content": f"[工具结果 {tool_name}] {result[:1500]}",
                 })
+
+                # 阶段 P.2：流式追加工具调用结果
+                if self._streaming_emitter is not None:
+                    try:
+                        self._streaming_emitter.append_chunk(f" → {tool_name} 完成")
+                    except Exception:
+                        pass
 
             elif action_type == "ask_user":
                 question = action.get("question", "需要更多信息")
@@ -698,7 +783,52 @@ class AgentLoop:
                 except Exception:
                     pass
 
+        # 阶段 P.2：流式思维链结束
+        if self._streaming_emitter is not None:
+            try:
+                self._streaming_emitter.end_thought()
+            except Exception:
+                pass
+
         return final_answer, executed_steps
+
+    def get_progress_summary(self) -> str:
+        """获取工具调用进度摘要（阶段 P.2）
+
+        Returns:
+            进度摘要字符串，未启用时返回空字符串
+        """
+        if self._progress_tracker is None:
+            return ""
+        try:
+            return self._progress_tracker.render_summary()
+        except Exception:
+            return ""
+
+    def interrupt(self, reason: str = "用户中断") -> None:
+        """触发中断（阶段 P.2）
+
+        Args:
+            reason: 中断原因
+        """
+        if self._interrupt_handler is not None:
+            try:
+                self._interrupt_handler.interrupt(reason)
+            except Exception:
+                pass
+
+    def get_progress_stats(self) -> Dict[str, Any]:
+        """获取工具调用统计（阶段 P.2）
+
+        Returns:
+            统计字典，未启用时返回空字典
+        """
+        if self._progress_tracker is None:
+            return {}
+        try:
+            return self._progress_tracker.get_stats()
+        except Exception:
+            return {}
 
 
 # ============================================================================

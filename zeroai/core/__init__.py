@@ -178,6 +178,50 @@ from .agent import (
     MultiAgentCollaborator,
 )
 
+# 阶段 N：代码执行沙箱
+from .sandbox import (
+    CodeSafetyChecker,
+    CodeSandbox,
+    check_code_safety,
+)
+
+# 阶段 O：多 Agent 协作增强
+from .agent_bus import (
+    AgentMessage,
+    MessageBus,
+    Blackboard,
+    get_message_bus,
+    get_blackboard,
+)
+from .dynamic_roles import (
+    RoleNode,
+    CollaborationContext,
+    RoleDependencyGraph,
+    EnhancedMultiAgentCollaborator,
+)
+
+# 阶段 P：流式思维链 + 中断响应 + 进度跟踪
+from .streaming import (
+    ThoughtChunk,
+    StreamingThoughtEmitter,
+    InterruptionHandler,
+    ToolCallProgress,
+    ProgressTracker,
+    get_streaming_emitter,
+    get_interrupt_handler,
+    get_progress_tracker,
+    reset_streaming,
+)
+
+# 阶段 Q：项目代码知识图谱
+from .code_knowledge_graph import (
+    CodeNode,
+    CodeEdge,
+    CodeKnowledgeGraph,
+    get_code_knowledge_graph,
+    reset_code_knowledge_graph,
+)
+
 __all__ = [
     # 原有模块
     "get_config", "load_config",
@@ -238,4 +282,19 @@ __all__ = [
     "get_advanced_agent_loop", "reset_advanced_agent_loop",
     # 阶段 B.4 多 Agent 协作
     "AgentRole", "MultiAgentCollaborator",
+    # 阶段 N：代码执行沙箱
+    "CodeSafetyChecker", "CodeSandbox", "check_code_safety",
+    # 阶段 O：多 Agent 协作增强
+    "AgentMessage", "MessageBus", "Blackboard",
+    "get_message_bus", "get_blackboard",
+    "RoleNode", "CollaborationContext", "RoleDependencyGraph",
+    "EnhancedMultiAgentCollaborator",
+    # 阶段 P：流式思维链 + 中断响应 + 进度跟踪
+    "ThoughtChunk", "StreamingThoughtEmitter", "InterruptionHandler",
+    "ToolCallProgress", "ProgressTracker",
+    "get_streaming_emitter", "get_interrupt_handler", "get_progress_tracker",
+    "reset_streaming",
+    # 阶段 Q：项目代码知识图谱
+    "CodeNode", "CodeEdge", "CodeKnowledgeGraph",
+    "get_code_knowledge_graph", "reset_code_knowledge_graph",
 ]

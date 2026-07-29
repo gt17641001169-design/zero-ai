@@ -90,6 +90,15 @@ from zeroai.tools.voice import (
     speak_tts,
     listen_asr,
 )
+from zeroai.tools.command_exec import (
+    code_execute,
+    code_check,
+)
+from zeroai.tools.command_exec import (
+    code_graph_index,
+    code_graph_query,
+    code_graph_stats,
+)
 
 
 # ============================================================================
@@ -218,6 +227,37 @@ TOOLS = [
             "package": {"type": "string", "description": "包名（list操作时留空）"},
             "action": {"type": "string", "description": "操作：install（安装）/ uninstall（卸载）/ check（检查）/ list（列出已安装）"}},
             "required": ["action"],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "code_execute", "description": "在安全沙箱中执行 Python 代码（阶段 N.2）。使用 AST 静态分析 + 子进程隔离的双重保护，禁止危险调用（os.system/subprocess 等），默认禁用网络访问。当用户让你运行复杂Python代码、数据分析、算法验证时调用，比 exec_python 更安全。",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Python 代码"},
+            "timeout": {"type": "integer", "description": "超时秒数（1-60，默认10）"},
+            "stdin_input": {"type": "string", "description": "标准输入内容（可选）"}},
+            "required": ["code"],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "code_check", "description": "检查 Python 代码安全性（阶段 N.2，不执行）。静态分析代码中的危险调用，返回检查结果。当用户想验证代码是否安全时调用。",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Python 代码"}},
+            "required": ["code"],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "code_graph_index", "description": "构建项目代码知识图谱（阶段 Q.1）。扫描指定目录下的 Python 文件，使用 AST 解析提取模块/类/函数节点及调用/继承/导入关系。当用户问代码结构、调用关系、继承关系、想分析项目架构时调用。",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "项目目录路径，默认当前目录"}},
+            "required": [],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "code_graph_query", "description": "自然语言查询代码结构（阶段 Q.2）。基于已构建的代码知识图谱，回答关于代码结构的自然语言问题。支持：谁调用了X/X的子类/X定义在哪里/X的调用链等。需先调用 code_graph_index 构建索引。",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "自然语言问题，如'谁调用了 run_command 函数？'、'AgentLoop 的子类有哪些？'、'run 函数定义在哪里？'"}},
+            "required": ["question"],
+            "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "code_graph_stats", "description": "获取代码知识图谱统计信息（阶段 Q.2）。返回节点数、边数、模块数等统计。当用户问代码规模、图谱状态时调用。",
+        "parameters": {"type": "object", "properties": {},
+            "required": [],
             "additionalProperties": False}}},
     {"type": "function", "function": {
         "name": "check_port", "description": "检测端口占用情况，返回占用进程信息。当用户问端口占用、服务是否启动时调用。",
@@ -579,7 +619,9 @@ TOOL_MAP = {
     "create_dir": create_dir, "system_info": system_info,
     "process_list": process_list,
     "edit_file": edit_file, "exec_python": exec_python,
-    "pip_install": pip_install, "check_port": check_port,
+    "pip_install": pip_install, "code_execute": code_execute, "code_check": code_check,
+    "code_graph_index": code_graph_index, "code_graph_query": code_graph_query, "code_graph_stats": code_graph_stats,
+    "check_port": check_port,
     "file_diff": file_diff, "read_image": read_image,
     "active_window": active_window, "list_windows": list_windows,
     "read_screen": read_screen_content,

@@ -86,3 +86,10 @@ include = ["zeroai*", "zeroai_tui*"]
 "*" = ["assets/icons/*"]
 # zeroai_tui 包含 Zig 共享库和 C 源码
 "zeroai_tui" = ["*.dll", "*.so", "*.dylib", "src/*.c"]
+
+[tool.pytest.ini_options]
+# pytest-asyncio 自动模式：无需 @pytest.mark.asyncio 装饰器
+asyncio_mode = "auto"
+# 禁用 xonsh pytest 插件（与 Windows 控制台不兼容）
+addopts = "-p no:xonsh"
+testpaths = ["."]
