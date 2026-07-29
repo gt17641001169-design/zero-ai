@@ -10161,8 +10161,9 @@ AI：已完成！Windows 资源管理器输入 \\\\192.168.71.132\\shared 即可
 - 当用户要求"找项目"、"看我的项目"、"看代码"时，**主动**调用 list_dir 探索
 
 # 项目上下文理解（仿 OpenCode AGENTS.md 机制）
-- **AGENTS.md**：如果项目根目录有 AGENTS.md 文件，它会自动加载到你的上下文中，包含项目结构、技术栈、关键文件、依赖列表等信息
-- **/初始化 命令**：用户输入 /init 或 /初始化 时，你会自动分析项目结构并生成 AGENTS.md
+- **AGENTS.md**：项目根目录的 AGENTS.md 文件会在启动时**自动加载**到你的上下文中，包含项目结构、技术栈、关键文件、依赖列表等信息
+- **自动生成**：如果项目没有 AGENTS.md，ZeroAI 会在启动时自动扫描项目结构并生成一份
+- **手动刷新**：用户输入 /init 或 /初始化 可手动重新生成 AGENTS.md（项目结构变更后使用）
 - **代码知识图谱**：你可以调用 `code_graph_index(path)` 构建项目代码的 AST 知识图谱，然后用 `code_graph_query(question)` 自然语言查询代码结构（谁调用了X、X的子类、调用链等）
 - **项目理解策略**：有 AGENTS.md 时优先基于它理解项目全局；需要深入代码细节时用 code_graph_index 构建图谱；需要看具体文件时用 read_file
 
@@ -12605,7 +12606,8 @@ class ZeroAI(App):
 
     def __init__(self):
         super().__init__()
-        # ── 自动加载 AGENTS.md（仿 OpenCode 项目上下文机制）──
+        # ── 自动加载/生成 AGENTS.md（仿 OpenCode 项目上下文机制）──
+        # 启动时自动检测：有 AGENTS.md 就加载，没有就自动生成
         self._agents_md_content = ""
         _agents_path = os.path.join(WORK_DIR, "AGENTS.md")
         if os.path.exists(_agents_path):
@@ -12614,6 +12616,12 @@ class ZeroAI(App):
                     self._agents_md_content = _f.read().strip()
             except Exception:
                 pass
+        else:
+            # 没有 AGENTS.md，自动生成（静默模式，不显示 UI）
+            try:
+                self._agents_md_content = _auto_generate_agents_md(WORK_DIR)
+            except Exception:
+                self._agents_md_content = ""
         # 如果有 AGENTS.md，注入到 system prompt
         if self._agents_md_content:
             _full_system = SYSTEM_PROMPT + "\n\n# 项目上下文（AGENTS.md）\n" + self._agents_md_content
@@ -13867,212 +13875,221 @@ class ZeroAI(App):
             t = threading.Thread(target=_do_tts, daemon=True)
             t.start()
 
+def _auto_generate_agents_md(project_dir: str) -> str:
+    """自动扫描项目结构并生成 AGENTS.md 内容（静默模式，不依赖 UI）
+
+    返回 AGENTS.md 文件内容字符串。如果项目过小或无法扫描，返回空字符串。
+    """
+    import os as _os
+    import re as _re
+
+    _IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv",
+                    ".idea", ".vs", ".vscode", "dist", "build", ".eggs",
+                    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+                    "htmlcov", ".coverage", ".trae-cn"}
+    _IGNORE_EXTS = {".pyc", ".pyo", ".so", ".dll", ".exe", ".lib", ".obj",
+                    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".woff",
+                    ".woff2", ".ttf", ".eot", ".zip", ".tar", ".gz", ".7z",
+                    ".onnx", ".pt", ".bin", ".safetensors"}
+
+    dir_tree = []
+    file_list = []
+    tech_stack = set()
+    key_files = {}
+
+    try:
+        for root, dirs, files in _os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in _IGNORE_DIRS and not d.startswith(".")]
+            rel_root = _os.path.relpath(root, project_dir)
+            depth = 0 if rel_root == "." else rel_root.count(_os.sep) + 1
+            if depth > 3:
+                dirs[:] = []
+                continue
+
+            if rel_root != ".":
+                indent = "  " * depth
+                dir_tree.append(f"{indent}{_os.path.basename(root)}/")
+
+            for f in sorted(files):
+                ext = _os.path.splitext(f)[1].lower()
+                if ext in _IGNORE_EXTS:
+                    continue
+                fpath = _os.path.join(root, f)
+                rel_path = _os.path.relpath(fpath, project_dir)
+                file_list.append(rel_path)
+
+                if f == "pyproject.toml":
+                    tech_stack.add("Python")
+                    key_files["pyproject.toml"] = rel_path
+                elif f == "setup.py":
+                    tech_stack.add("Python")
+                    key_files["setup.py"] = rel_path
+                elif f == "requirements.txt":
+                    tech_stack.add("Python")
+                    key_files["requirements.txt"] = rel_path
+                elif f == "package.json":
+                    tech_stack.add("Node.js")
+                    key_files["package.json"] = rel_path
+                elif f == "Cargo.toml":
+                    tech_stack.add("Rust")
+                    key_files["Cargo.toml"] = rel_path
+                elif f == "go.mod":
+                    tech_stack.add("Go")
+                    key_files["go.mod"] = rel_path
+                elif f == "CMakeLists.txt":
+                    tech_stack.add("C/C++")
+                    key_files["CMakeLists.txt"] = rel_path
+                elif f == "Makefile":
+                    tech_stack.add("Make")
+                elif f == "Dockerfile":
+                    tech_stack.add("Docker")
+                elif f == ".gitignore":
+                    key_files[".gitignore"] = rel_path
+                elif f in ("README.md", "readme.md"):
+                    key_files["README"] = rel_path
+
+            if len(file_list) > 200:
+                break
+    except Exception:
+        return ""
+
+    # 文件太少，可能是空目录，不生成
+    if len(file_list) < 3:
+        return ""
+
+    # 读取 pyproject.toml
+    project_name = _os.path.basename(project_dir)
+    project_version = ""
+    dependencies = []
+
+    pyproject_path = _os.path.join(project_dir, "pyproject.toml")
+    if _os.path.exists(pyproject_path):
+        try:
+            with open(pyproject_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            name_m = _re.search(r'name\s*=\s*"([^"]+)"', content)
+            ver_m = _re.search(r'version\s*=\s*"([^"]+)"', content)
+            if name_m:
+                project_name = name_m.group(1)
+            if ver_m:
+                project_version = ver_m.group(1)
+            dep_section = _re.search(r'dependencies\s*=\s*\[([\s\S]*?)\]', content)
+            if dep_section:
+                deps_raw = dep_section.group(1)
+                dependencies = _re.findall(r'"([^"]+)"', deps_raw)
+        except Exception:
+            pass
+
+    # 生成 AGENTS.md 内容
+    lines = []
+    lines.append(f"# AGENTS.md — {project_name} 项目上下文")
+    lines.append("")
+    lines.append("> 此文件由 ZeroAI 自动生成，帮助 AI 理解项目结构。")
+    lines.append("> 修改项目结构后重启 ZeroAI 或运行 /初始化 更新。")
+    lines.append("")
+    lines.append("## 项目信息")
+    lines.append(f"- **名称**：{project_name}")
+    if project_version:
+        lines.append(f"- **版本**：{project_version}")
+    lines.append(f"- **路径**：{project_dir}")
+    lines.append(f"- **技术栈**：{', '.join(tech_stack) if tech_stack else '未检测到'}")
+    lines.append("")
+
+    lines.append("## 目录结构")
+    lines.append("```")
+    lines.append(f"{project_name}/")
+    for d in dir_tree[:50]:
+        lines.append(d)
+    lines.append("```")
+    lines.append("")
+
+    if key_files:
+        lines.append("## 关键文件")
+        for name, path in key_files.items():
+            lines.append(f"- `{path}` — {name}")
+        lines.append("")
+
+    if dependencies:
+        lines.append("## 核心依赖")
+        for dep in dependencies[:20]:
+            lines.append(f"- {dep}")
+        if len(dependencies) > 20:
+            lines.append(f"- ... 共 {len(dependencies)} 个依赖")
+        lines.append("")
+
+    ext_counts = {}
+    for fpath in file_list:
+        ext = _os.path.splitext(fpath)[1].lower()
+        if ext:
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+    if ext_counts:
+        lines.append("## 文件类型统计")
+        for ext, cnt in sorted(ext_counts.items(), key=lambda x: -x[1])[:10]:
+            lines.append(f"- `{ext}` — {cnt} 个文件")
+        lines.append("")
+
+    lines.append("## 编码规范")
+    lines.append("- 使用中文注释和文档字符串")
+    lines.append("- Python 代码遵循 PEP 8")
+    lines.append("- 修改核心文件前必须备份")
+    lines.append("")
+
+    agents_content = "\n".join(lines)
+
+    # 写入文件
+    agents_path = _os.path.join(project_dir, "AGENTS.md")
+    try:
+        with open(agents_path, "w", encoding="utf-8") as f:
+            f.write(agents_content)
+    except Exception:
+        pass  # 写入失败也返回内容，至少这次会话能用
+
+    return agents_content
+
+
     def _init_project_agents(self):
-        """仿 OpenCode：分析项目结构，生成 AGENTS.md 项目上下文文件
+        """手动重新生成 AGENTS.md（/init 命令入口）
 
-        AGENTS.md 包含：
-        - 项目类型和技术栈
-        - 目录结构（自动扫描，忽略 node_modules/.git/__pycache__ 等）
-        - 关键文件清单
-        - 编码规范（从 pyproject.toml/setup.cfg/.editorconfig 等检测）
-        - 依赖列表（从 requirements.txt/pyproject.toml 检测）
-
-        生成后自动加载到 system prompt，让 AI 有项目全局视野。
+        启动时已自动生成，此命令用于项目结构变更后手动刷新。
         """
-        import os
-        import json
-
         project_dir = WORK_DIR
         agents_path = os.path.join(project_dir, "AGENTS.md")
 
         self._add_block("项目初始化", C_CYAN)
         self._add_static(Text.assemble(
-            (f"  {_load_svg_icon('folder')} 正在分析项目结构：{project_dir}\n", f"bold {C_CYAN}"),
+            (f"  {_load_svg_icon('folder')} 正在重新分析项目结构：{project_dir}\n", f"bold {C_CYAN}"),
         ))
 
-        # ── 1. 扫描目录结构 ──
-        _IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv",
-                        ".idea", ".vs", ".vscode", "dist", "build", ".eggs",
-                        ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-                        "htmlcov", ".coverage", "*.egg-info", ".git"}
-        _IGNORE_EXTS = {".pyc", ".pyo", ".so", ".dll", ".exe", ".lib", ".obj",
-                        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".woff",
-                        ".woff2", ".ttf", ".eot", ".zip", ".tar", ".gz", ".7z"}
+        # 调用静态函数生成
+        agents_content = _auto_generate_agents_md(project_dir)
 
-        dir_tree = []
-        file_list = []
-        tech_stack = set()
-        key_files = {}
-
-        try:
-            for root, dirs, files in os.walk(project_dir):
-                # 过滤忽略目录
-                dirs[:] = [d for d in dirs if d not in _IGNORE_DIRS and not d.startswith(".")]
-                # 限制深度（最多 3 层）
-                rel_root = os.path.relpath(root, project_dir)
-                depth = 0 if rel_root == "." else rel_root.count(os.sep) + 1
-                if depth > 3:
-                    dirs[:] = []
-                    continue
-
-                if rel_root != ".":
-                    indent = "  " * depth
-                    dir_tree.append(f"{indent}{os.path.basename(root)}/")
-
-                for f in sorted(files):
-                    ext = os.path.splitext(f)[1].lower()
-                    if ext in _IGNORE_EXTS:
-                        continue
-                    fpath = os.path.join(root, f)
-                    rel_path = os.path.relpath(fpath, project_dir)
-                    file_list.append(rel_path)
-
-                    # 检测技术栈
-                    if f == "pyproject.toml":
-                        tech_stack.add("Python")
-                        key_files["pyproject.toml"] = rel_path
-                    elif f == "setup.py":
-                        tech_stack.add("Python")
-                        key_files["setup.py"] = rel_path
-                    elif f == "requirements.txt":
-                        tech_stack.add("Python")
-                        key_files["requirements.txt"] = rel_path
-                    elif f == "package.json":
-                        tech_stack.add("Node.js")
-                        key_files["package.json"] = rel_path
-                    elif f == "Cargo.toml":
-                        tech_stack.add("Rust")
-                        key_files["Cargo.toml"] = rel_path
-                    elif f == "go.mod":
-                        tech_stack.add("Go")
-                        key_files["go.mod"] = rel_path
-                    elif f == "CMakeLists.txt":
-                        tech_stack.add("C/C++")
-                        key_files["CMakeLists.txt"] = rel_path
-                    elif f == "Makefile":
-                        tech_stack.add("Make")
-                    elif f == "Dockerfile":
-                        tech_stack.add("Docker")
-                    elif f == ".gitignore":
-                        key_files[".gitignore"] = rel_path
-                    elif f == "README.md" or f == "readme.md":
-                        key_files["README"] = rel_path
-
-                # 限制文件数
-                if len(file_list) > 200:
-                    break
-
-        except Exception as e:
-            self._add_static(Text(f"  ⚠️ 扫描失败：{e}\n", style=C_YELLOW))
+        if not agents_content:
+            self._add_static(Text("  ⚠️ 项目文件过少或扫描失败，未生成 AGENTS.md\n", style=C_YELLOW))
             return
 
-        # ── 2. 读取 pyproject.toml 获取项目信息 ──
-        project_name = os.path.basename(project_dir)
-        project_version = ""
-        dependencies = []
-
-        pyproject_path = os.path.join(project_dir, "pyproject.toml")
-        if os.path.exists(pyproject_path):
-            try:
-                with open(pyproject_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                # 简单解析 name 和 version
-                import re
-                name_m = re.search(r'name\s*=\s*"([^"]+)"', content)
-                ver_m = re.search(r'version\s*=\s*"([^"]+)"', content)
-                if name_m:
-                    project_name = name_m.group(1)
-                if ver_m:
-                    project_version = ver_m.group(1)
-                # 提取依赖
-                dep_section = re.search(r'dependencies\s*=\s*\[([\s\S]*?)\]', content)
-                if dep_section:
-                    deps_raw = dep_section.group(1)
-                    dependencies = re.findall(r'"([^"]+)"', deps_raw)
-            except Exception:
-                pass
-
-        # ── 3. 生成 AGENTS.md ──
-        lines = []
-        lines.append(f"# AGENTS.md — {project_name} 项目上下文")
-        lines.append("")
-        lines.append("> 此文件由 ZeroAI /init 命令自动生成，帮助 AI 理解项目结构。")
-        lines.append("> 修改项目结构后重新运行 /init 更新。")
-        lines.append("")
-        lines.append("## 项目信息")
-        lines.append(f"- **名称**：{project_name}")
-        if project_version:
-            lines.append(f"- **版本**：{project_version}")
-        lines.append(f"- **路径**：{project_dir}")
-        lines.append(f"- **技术栈**：{', '.join(tech_stack) if tech_stack else '未检测到'}")
-        lines.append("")
-
-        lines.append("## 目录结构")
-        lines.append("```")
-        lines.append(f"{project_name}/")
-        for d in dir_tree[:50]:
-            lines.append(d)
-        lines.append("```")
-        lines.append("")
-
-        # 关键文件
-        if key_files:
-            lines.append("## 关键文件")
-            for name, path in key_files.items():
-                lines.append(f"- `{path}` — {name}")
-            lines.append("")
-
-        # 依赖列表
-        if dependencies:
-            lines.append("## 核心依赖")
-            for dep in dependencies[:20]:
-                lines.append(f"- {dep}")
-            if len(dependencies) > 20:
-                lines.append(f"- ... 共 {len(dependencies)} 个依赖")
-            lines.append("")
-
-        # 文件统计
-        ext_counts = {}
-        for fpath in file_list:
-            ext = os.path.splitext(fpath)[1].lower()
-            if ext:
-                ext_counts[ext] = ext_counts.get(ext, 0) + 1
-        if ext_counts:
-            lines.append("## 文件类型统计")
-            for ext, cnt in sorted(ext_counts.items(), key=lambda x: -x[1])[:10]:
-                lines.append(f"- `{ext}` — {cnt} 个文件")
-            lines.append("")
-
-        lines.append("## 编码规范")
-        lines.append("- 使用中文注释和文档字符串")
-        lines.append("- Python 代码遵循 PEP 8")
-        lines.append("- 修改核心文件前必须备份")
-        lines.append("")
-
-        agents_content = "\n".join(lines)
-
-        try:
-            with open(agents_path, "w", encoding="utf-8") as f:
-                f.write(agents_content)
-        except Exception as e:
-            self._add_static(Text(f"  ⚠️ 写入 AGENTS.md 失败：{e}\n", style=C_YELLOW))
-            return
-
-        # ── 4. 加载到 system prompt ──
+        # 加载到 system prompt
         self._agents_md_content = agents_content
-        # 更新当前 messages 中的 system prompt
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = self._get_system_prompt()
 
+        # 解析显示信息
+        import re as _re
+        name_m = _re.search(r'\*\*名称\*\*：(.+)', agents_content)
+        ver_m = _re.search(r'\*\*版本\*\*：(.+)', agents_content)
+        tech_m = _re.search(r'\*\*技术栈\*\*：(.+)', agents_content)
+        project_name = name_m.group(1) if name_m else os.path.basename(project_dir)
+        project_version = ver_m.group(1) if ver_m else ""
+        tech_stack = tech_m.group(1) if tech_m else "未检测到"
+
+        # 统计目录和文件数
+        dir_count = agents_content.count("/")
+        file_count = len([l for l in agents_content.split("\n") if l.startswith("- `")])
+
         self._add_static(Text.assemble(
-            (f"  ✅ AGENTS.md 已生成：{agents_path}\n", f"bold {C_FG}"),
+            (f"  ✅ AGENTS.md 已刷新：{agents_path}\n", f"bold {C_FG}"),
             (f"  │ 项目：{project_name}" + (f" v{project_version}" if project_version else "") + "\n", C_DIM),
-            (f"  │ 技术栈：{', '.join(tech_stack) if tech_stack else '未检测到'}\n", C_DIM),
-            (f"  │ 目录：{len(dir_tree)} 个子目录，{len(file_list)} 个文件\n", C_DIM),
-            (f"  │ 关键文件：{', '.join(key_files.keys()) if key_files else '无'}\n", C_DIM),
-            (f"  │ 依赖：{len(dependencies)} 个\n", C_DIM),
-            ("\n  💡 AI 现在拥有项目全局视野，回答代码相关问题时会更精准。\n", C_CYAN),
-            ("  💡 修改项目结构后重新运行 /初始化 更新。\n", C_DIM),
+            (f"  │ 技术栈：{tech_stack}\n", C_DIM),
+            ("\n  💡 AI 已更新项目上下文，回答代码相关问题时会更精准。\n", C_CYAN),
         ))
 
     def _show_help(self):
